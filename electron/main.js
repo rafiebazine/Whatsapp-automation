@@ -12,6 +12,36 @@ const {
 } = require('./identity');
 const { QueueManager } = require('./queue');
 const { parseSpreadsheet } = require('./spreadsheet');
+const { runWithTimeout } = require('./lifecycle');
+
+const STARTUP_STARTED_AT = Date.now();
+
+function startupLog(message, details) {
+  const elapsed = Date.now() - STARTUP_STARTED_AT;
+  if (details === undefined) {
+    console.log(`[STARTUP +${elapsed}ms] ${message}`);
+  } else {
+    console.log(`[STARTUP +${elapsed}ms] ${message}`, details);
+  }
+}
+
+function startupError(message, error) {
+  const elapsed = Date.now() - STARTUP_STARTED_AT;
+  const detail = error && error.stack ? error.stack : error;
+  if (detail === undefined) {
+    console.error(`[STARTUP +${elapsed}ms] ${message}`);
+  } else {
+    console.error(`[STARTUP +${elapsed}ms] ${message}`, detail);
+  }
+}
+
+process.on('uncaughtException', (error) => {
+  startupError('Uncaught exception', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  startupError('Unhandled promise rejection', reason);
+});
 
 app.setName('WhatsApp Group Manager');
 
@@ -217,7 +247,29 @@ function validateSettings(patch) {
   return next;
 }
 
+function escapeHtml(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function showWindowLoadError(message) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const safeMessage = escapeHtml(message || 'The application interface could not be loaded.');
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Startup error</title>
+    <style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#ECE5DD;color:#1f2c33;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;padding:24px}main{max-width:640px;background:#fff;border-radius:16px;padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.12)}h1{margin:0 0 10px;font-size:20px}p{margin:0;line-height:1.5;color:#54656f}pre{margin:16px 0 0;padding:12px;border-radius:10px;background:#f5f6f6;white-space:pre-wrap;word-break:break-word;color:#b42318}</style>
+    </head><body><main><h1>WhatsApp Group Manager could not start the interface</h1><p>The main process is running, but the window failed to load. Close and reopen the app. If this keeps happening, share the startup log.</p><pre>${safeMessage}</pre></main></body></html>`;
+  mainWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`).catch((error) => {
+    startupError('Failed to load startup error page', error);
+  });
+  if (!mainWindow.isVisible()) mainWindow.show();
+}
+
 function createWindow() {
+  startupLog('Creating browser window');
   mainWindow = new BrowserWindow({
     width: 1240,
     height: 820,
@@ -235,10 +287,69 @@ function createWindow() {
       spellcheck: false
     }
   });
-  mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html'));
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  let windowShown = false;
+  let showFallbackTimer = null;
+  const showWindow = (reason) => {
+    if (!mainWindow || mainWindow.isDestroyed() || windowShown) return;
+    windowShown = true;
+    if (showFallbackTimer) {
+      clearTimeout(showFallbackTimer);
+      showFallbackTimer = null;
+    }
+    mainWindow.show();
+    startupLog('Window shown', { reason });
+  };
+
+  mainWindow.webContents.on('did-finish-load', () => {
+    startupLog('Renderer finished loading');
+  });
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    startupError('Renderer failed to load', {
+      errorCode,
+      errorDescription,
+      url: validatedURL
+    });
+    showWindowLoadError(`${errorDescription || 'Unknown load error'} (${errorCode || 'no code'})`);
+    showWindow('did-fail-load');
+  });
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    startupError('Renderer process gone', details);
+    showWindowLoadError(`The renderer process stopped unexpectedly (${(details && details.reason) || 'unknown reason'}).`);
+    showWindow('render-process-gone');
+  });
+  mainWindow.webContents.on('preload-error', (_event, preloadPath, error) => {
+    startupError('Preload script failed', { preloadPath, error: error && (error.stack || error.message) });
+    showWindowLoadError(`The preload script failed: ${(error && error.message) || 'unknown error'}`);
+    showWindow('preload-error');
+  });
+  mainWindow.webContents.on('unresponsive', () => {
+    startupError('Renderer became unresponsive');
+    showWindow('unresponsive');
+  });
+  mainWindow.webContents.on('responsive', () => {
+    startupLog('Renderer responsive again');
+  });
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    if (level >= 2) {
+      startupError('Renderer console error', { message, line, sourceId });
+    }
+  });
+
+  mainWindow.once('ready-to-show', () => showWindow('ready-to-show'));
+  showFallbackTimer = setTimeout(() => {
+    startupError('Window was not shown by ready-to-show; showing fallback');
+    showWindow('fallback-timeout');
+  }, 5000);
+
+  mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html')).catch((error) => {
+    startupError('loadFile failed', error);
+    showWindowLoadError(error && error.message ? error.message : 'The application files could not be loaded.');
+    showWindow('loadFile-catch');
+  });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('closed', () => {
+    if (showFallbackTimer) clearTimeout(showFallbackTimer);
     mainWindow = null;
   });
 }
@@ -301,7 +412,10 @@ function registerIpc() {
     db.save();
     currentUser = cleanUser;
     sessions.setMasterKey(deriveKey(password, saltHex));
-    await sessions.startAll();
+    startupLog('Local login created; starting sessions in background');
+    sessions.startAll().catch((error) => {
+      startupError('Failed to start sessions after setup', error);
+    });
     queue.start();
     broadcast('auth:changed', { authenticated: true });
     return { username: cleanUser };
@@ -314,7 +428,10 @@ function registerIpc() {
     if (!validUser || !validPassword) throw new Error('Incorrect username or password.');
     currentUser = db.data.auth.username;
     sessions.setMasterKey(deriveKey(String(password), db.data.auth.kdfSalt));
-    await sessions.startAll();
+    startupLog('Login accepted; starting sessions in background');
+    sessions.startAll().catch((error) => {
+      startupError('Failed to start sessions after login', error);
+    });
     queue.start();
     broadcast('auth:changed', { authenticated: true });
     return { username: currentUser };
@@ -503,16 +620,34 @@ function registerIpc() {
 }
 
 async function boot() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-  db = new Database(DB_FILE);
-  db.load();
-  db.resetDailyCounters();
-  sessions = new SessionManager({ db, sessionsRoot: SESSIONS_DIR });
-  queue = new QueueManager({ db, sessions });
-  wireEvents();
-  registerIpc();
-  createWindow();
+  startupLog('Application starting');
+  const stage = (label, operation) => {
+    const startedAt = Date.now();
+    startupLog(`${label}...`);
+    const result = operation();
+    startupLog(`${label} OK (${Date.now() - startedAt}ms)`);
+    return result;
+  };
+
+  stage('Initializing directories', () => {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  });
+  stage('Loading database', () => {
+    db = new Database(DB_FILE);
+    db.load();
+  });
+  stage('Resetting daily counters', () => db.resetDailyCounters());
+  stage('Initializing session manager', () => {
+    sessions = new SessionManager({ db, sessionsRoot: SESSIONS_DIR });
+  });
+  stage('Initializing queue manager', () => {
+    queue = new QueueManager({ db, sessions });
+  });
+  stage('Wiring events', () => wireEvents());
+  stage('Registering IPC', () => registerIpc());
+  stage('Creating window', () => createWindow());
+  startupLog('Application ready');
 }
 
 const singleInstance = app.requestSingleInstanceLock();
@@ -533,7 +668,7 @@ if (!singleInstance) {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
   }).catch((error) => {
-    console.error('App boot failed:', error);
+    startupError('App boot failed', error);
   });
 
   app.on('window-all-closed', () => {
@@ -546,10 +681,18 @@ if (!singleInstance) {
     quitting = true;
     if (queue) queue.pause();
     const finish = () => app.quit();
-    if (sessions) {
-      sessions.stopAll().then(finish).catch(finish);
-    } else {
+    if (!sessions) {
       finish();
+      return;
     }
+    runWithTimeout(() => sessions.stopAll(), 5000).then((result) => {
+      if (result.timedOut) {
+        startupError('Graceful shutdown timed out; forcing exit', result.error);
+        app.exit(0);
+        return;
+      }
+      if (result.error) startupError('Session shutdown failed', result.error);
+      finish();
+    });
   });
 }

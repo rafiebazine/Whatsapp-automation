@@ -38,6 +38,12 @@ npx electron-builder --linux AppImage
 
 Output: `dist/WhatsApp Group Manager-1.0.0.AppImage`.
 
+If the AppImage is launched directly from a terminal on a Linux system that blocks Electron's SUID sandbox helper, start it with `--no-sandbox` or use the generated desktop entry:
+
+```bash
+./"dist/WhatsApp Group Manager-1.0.0.AppImage" --no-sandbox
+```
+
 ## Use
 
 1. Open **Settings → Admin accounts** and add an account, then scan its QR code from WhatsApp **Linked devices**.

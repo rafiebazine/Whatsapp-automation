@@ -117,3 +117,76 @@ test('uses participant JIDs for admins without duplicating legacy phone admins',
   assert.deepEqual(data.groups[0].adminIds, ['111@lid', '212600000099@s.whatsapp.net']);
   assert.equal(data.groups[0].members[0].isAdmin, true);
 });
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { Database } = require('../electron/db');
+
+function tempDatabase(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wgm-db-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return { dir, file: path.join(dir, 'whatsapp-group-manager.json') };
+}
+
+test('creates a default database when the directory and file are missing', (t) => {
+  const { dir, file } = tempDatabase(t);
+  const database = new Database(file);
+  const data = database.load();
+
+  assert.equal(data.version, 3);
+  assert.equal(data.auth, null);
+  assert.deepEqual(data.accounts, []);
+  assert.deepEqual(data.groups, []);
+  assert.deepEqual(data.contacts, []);
+  assert.deepEqual(data.jobs, []);
+  assert.equal(fs.existsSync(dir), true);
+  assert.equal(fs.existsSync(file), true);
+});
+
+test('migrates a v2 database on load and persists version 3', (t) => {
+  const { file } = tempDatabase(t);
+  fs.writeFileSync(file, JSON.stringify({
+    version: 2,
+    accounts: [{ id: 'acc_1', alias: 'Admin', phoneNumber: '212612345678' }],
+    groups: [{
+      id: '120363000000000003@g.us',
+      name: 'V2 group',
+      adminIds: ['212612345678'],
+      adminAccountIds: ['acc_1'],
+      members: [{ phoneNumber: '212699999999', displayName: 'Member' }]
+    }],
+    contacts: [],
+    jobs: []
+  }), 'utf8');
+
+  const database = new Database(file);
+  const data = database.load();
+
+  assert.equal(data.version, 3);
+  assert.equal(data.accounts[0].whatsappJid, '212612345678@s.whatsapp.net');
+  assert.deepEqual(data.groups[0].adminIds, ['212612345678@s.whatsapp.net']);
+
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.version, 3);
+  assert.equal(saved.accounts[0].whatsappJid, '212612345678@s.whatsapp.net');
+});
+
+test('backs up an unreadable database instead of silently overwriting it', (t) => {
+  const { dir, file } = tempDatabase(t);
+  const original = '{ this is not valid json';
+  fs.writeFileSync(file, original, 'utf8');
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  t.after(() => { console.error = originalConsoleError; });
+
+  const database = new Database(file);
+  const data = database.load();
+
+  assert.equal(data.version, 3);
+  assert.deepEqual(data.accounts, []);
+  const backups = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
+  assert.equal(backups.length, 1);
+  assert.equal(fs.readFileSync(path.join(dir, backups[0]), 'utf8'), original);
+  assert.equal(fs.existsSync(file), true);
+});

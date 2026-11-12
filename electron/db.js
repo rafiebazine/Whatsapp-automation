@@ -75,7 +75,17 @@ class Database {
       }
     } catch (error) {
       console.error('Failed to load local database:', error);
+      try {
+        if (fs.existsSync(this.filePath)) {
+          const backup = `${this.filePath}.corrupt-${Date.now()}`;
+          fs.renameSync(this.filePath, backup);
+          console.error(`Preserved unreadable database at ${backup}`);
+        }
+      } catch (backupError) {
+        console.error('Failed to preserve unreadable database:', backupError);
+      }
       this.data = defaultData();
+      this.save();
     }
     return this.data;
   }
