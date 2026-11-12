@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const XLSX = require('xlsx');
 const { Database } = require('./db');
 const { SessionManager, friendlyError, normalizePhone } = require('./session-manager');
+const { normalizeJid, isPnJid, isLidJid } = require('./identity');
 const { QueueManager } = require('./queue');
 
 app.setName('WhatsApp Group Manager');
@@ -48,6 +49,9 @@ function publicAccount(account) {
     id: account.id,
     alias: account.alias,
     phoneNumber: account.phoneNumber,
+    whatsappId: account.whatsappId || '',
+    whatsappJid: account.whatsappJid || '',
+    whatsappLid: account.whatsappLid || '',
     status: account.status,
     dailyActionCount: account.dailyActionCount,
     dailyActionLimit: account.dailyActionLimit,
@@ -80,8 +84,8 @@ function fullGroup(group) {
   return {
     ...groupSummary(group),
     members: (group.members || []).slice().sort((a, b) => {
-      const aName = (a.displayName || a.phoneNumber).toLowerCase();
-      const bName = (b.displayName || b.phoneNumber).toLowerCase();
+      const aName = (a.displayName || a.phoneNumber || a.id || '').toLowerCase();
+      const bName = (b.displayName || b.phoneNumber || b.id || '').toLowerCase();
       return aName.localeCompare(bName);
     })
   };
@@ -120,6 +124,9 @@ function serializeJobs() {
 function serializeContacts() {
   return db.data.contacts
     .map((contact) => ({
+      id: contact.id || '',
+      jid: contact.jid || '',
+      lid: contact.lid || '',
       phoneNumber: contact.phoneNumber,
       name: contact.name || '',
       sourceAccounts: (contact.sourceAccounts || [])
@@ -130,7 +137,8 @@ function serializeContacts() {
         .filter(Boolean),
       lastSyncedAt: contact.lastSyncedAt
     }))
-    .sort((a, b) => (a.name || a.phoneNumber).localeCompare(b.name || b.phoneNumber));
+    .sort((a, b) => String(a.name || a.phoneNumber || a.id || a.jid || a.lid || '')
+      .localeCompare(String(b.name || b.phoneNumber || b.id || b.jid || b.lid || '')));
 }
 
 function snapshot() {
@@ -224,10 +232,12 @@ function parseSpreadsheet(name, bytes) {
   const dataRows = looksLikeHeader ? rows.slice(1) : rows;
   const result = [];
   for (const row of dataRows.slice(0, 5000)) {
-    const number = normalizePhone(row[0]);
+    const raw = String(row[0] || '').trim();
+    const jid = raw.includes('@') ? normalizeJid(raw) : '';
+    const number = (isPnJid(jid) || isLidJid(jid)) ? jid : normalizePhone(raw);
     const rawName = String(row[1] || '').trim();
     if (!number && !rawName) continue;
-    result.push({ number: String(row[0] || '').trim(), name: rawName });
+    result.push({ number: number || raw, name: rawName });
   }
   return result;
 }
@@ -397,7 +407,9 @@ function registerIpc() {
       if (job.groupId !== groupId || job.type !== mode) continue;
       if (job.status !== 'queued' && job.status !== 'running') continue;
       for (const target of job.targets || []) {
-        if (target.status === 'pending' || target.status === 'running') pendingNumbers.push(target.number);
+        if (target.status === 'pending' || target.status === 'running') {
+          pendingNumbers.push(target.jid || target.number);
+        }
       }
     }
     return {
@@ -415,7 +427,8 @@ function registerIpc() {
       type: payload.type,
       groupId: payload.groupId,
       numbers: payload.numbers || [],
-      names: payload.names || {}
+      names: payload.names || {},
+      targets: payload.targets || null
     });
     return { id: job.id, total: job.targets.length };
   });

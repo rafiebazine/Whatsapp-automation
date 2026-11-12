@@ -5,20 +5,31 @@ const pino = require('pino');
 const QRCode = require('qrcode');
 const { loadBaileys } = require('./baileys-loader');
 const { useEncryptedAuthState } = require('./auth-store');
+const {
+  normalizeJid,
+  isPnJid,
+  isLidJid,
+  phoneDigits,
+  phoneFromJid,
+  jidFromPhone,
+  participantIdentity,
+  identityKeys,
+  identityMatches,
+  participantIsAdmin,
+  participantIsSuperAdmin,
+  normalizeAdminId,
+  accountIsAdminOfGroup,
+  preferredAccountJid,
+  identitySummary
+} = require('./identity');
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function phoneFromJid(jid) {
-  if (!jid || typeof jid !== 'string') return '';
-  if (!jid.includes('@s.whatsapp.net')) return '';
-  return jid.split('@')[0].split(':')[0].replace(/\D/g, '');
-}
-
 function normalizePhone(value) {
   if (value === null || value === undefined) return '';
   let text = String(value).trim();
-  if (!text) return '';
+  if (!text || text.includes('@')) return '';
   text = text.replace(/[\s\-().]/g, '');
   if (text.startsWith('00')) text = `+${text.slice(2)}`;
   const hasPlus = text.startsWith('+');
@@ -27,6 +38,12 @@ function normalizePhone(value) {
   if (!hasPlus && digits.length < 8) return '';
   if (digits.length < 8 || digits.length > 15) return '';
   return `+${digits}`;
+}
+
+function targetLabel(target) {
+  if (target === null || target === undefined) return '';
+  if (typeof target === 'string') return target;
+  return target.number || target.jid || target.id || '';
 }
 
 function friendlyError(error) {
@@ -96,12 +113,36 @@ class SessionManager extends EventEmitter {
     return Boolean(entry && entry.connected);
   }
 
+  updateAccountIdentity(account, user) {
+    if (!account || !user) return false;
+    const identity = participantIdentity(user, {});
+    let changed = false;
+
+    if (identity.id && account.whatsappId !== identity.id) {
+      account.whatsappId = identity.id;
+      changed = true;
+    }
+    if (identity.jid && account.whatsappJid !== identity.jid) {
+      account.whatsappJid = identity.jid;
+      changed = true;
+    }
+    if (identity.lid && account.whatsappLid !== identity.lid) {
+      account.whatsappLid = identity.lid;
+      changed = true;
+    }
+    const phone = identity.phoneNumber || phoneFromJid(account.whatsappJid);
+    if (phone && account.phoneNumber !== phone) {
+      account.phoneNumber = phone;
+      changed = true;
+    }
+    if (changed) {
+      console.info('[identity] account identity updated', identitySummary(account));
+    }
+    return changed;
+  }
+
   isAdminOf(account, group) {
-    if (!account || !group) return false;
-    return Boolean(
-      (account.phoneNumber && group.adminIds && group.adminIds.includes(account.phoneNumber)) ||
-      (group.adminAccountIds && group.adminAccountIds.includes(account.id))
-    );
+    return accountIsAdminOfGroup(account, group);
   }
 
   async startAccount(accountId) {
@@ -165,16 +206,13 @@ class SessionManager extends EventEmitter {
     this.sockets.set(accountId, entry);
     this.manualStops.delete(accountId);
 
-    sock.ev.on('creds.update', async () => {
+    sock.ev.on('creds.update', async (update) => {
       try {
         await authState.saveCreds();
-        if (sock.user && sock.user.id) {
-          const phone = phoneFromJid(sock.user.id);
-          if (phone && account.phoneNumber !== phone) {
-            account.phoneNumber = phone;
-            this.db.save();
-            this.emit('accounts:update');
-          }
+        const me = (update && update.me) || sock.user;
+        if (this.updateAccountIdentity(account, me)) {
+          this.db.save();
+          this.emit('accounts:update');
         }
       } catch (error) {
         console.error('Failed saving credentials:', error);
@@ -210,7 +248,7 @@ class SessionManager extends EventEmitter {
           account.connectedAt = new Date().toISOString();
           account.lastActiveAt = new Date().toISOString();
           if (sock.user && sock.user.id) {
-            account.phoneNumber = phoneFromJid(sock.user.id);
+            this.updateAccountIdentity(account, sock.user);
           }
           const autoPaused = account.pausedForDay && account.pausedForDay === this.db.todayKey();
           account.status = autoPaused ? 'paused' : 'connected';
@@ -300,13 +338,19 @@ class SessionManager extends EventEmitter {
       try {
         const group = this.db.findGroup(event.id);
         if (!group) return;
-        const changedNumbers = (event.participants || []).map(phoneFromJid).filter(Boolean);
+        const changed = (event.participants || [])
+          .map((jid) => participantIdentity({ id: jid }, { id: jid }))
+          .filter((identity) => identity.id);
+
         if (event.action === 'add') {
-          for (const number of changedNumbers) {
-            if (!group.members.some((member) => member.phoneNumber === number)) {
+          for (const identity of changed) {
+            const existing = group.members.find((member) => identityMatches(member, identity));
+            if (!existing) {
               group.members.push({
-                phoneNumber: number,
-                displayName: this.db.contactName(number),
+                ...identity,
+                displayName: this.db.contactName(identity),
+                isAdmin: false,
+                isSuperAdmin: false,
                 joinedViaApp: false,
                 addedAt: new Date().toISOString()
               });
@@ -314,21 +358,43 @@ class SessionManager extends EventEmitter {
           }
         }
         if (event.action === 'remove') {
-          group.members = group.members.filter((member) => !changedNumbers.includes(member.phoneNumber));
+          group.members = group.members.filter(
+            (member) => !changed.some((identity) => identityMatches(member, identity))
+          );
+          group.adminIds = (group.adminIds || []).filter(
+            (adminId) => !changed.some((identity) => identityMatches(adminId, identity))
+          );
         }
         if (event.action === 'promote') {
-          for (const number of changedNumbers) {
-            if (!group.adminIds.includes(number)) group.adminIds.push(number);
-            const linked = this.db.data.accounts.find((item) => item.phoneNumber === number);
-            if (linked && !group.adminAccountIds.includes(linked.id)) group.adminAccountIds.push(linked.id);
+          for (const identity of changed) {
+            if (!group.adminIds.some((adminId) => identityMatches(adminId, identity))) {
+              group.adminIds.push(identity.id);
+            }
+            const member = group.members.find((item) => identityMatches(item, identity));
+            if (member) member.isAdmin = true;
+            const linked = this.db.data.accounts.find((item) => identityMatches(item, identity));
+            if (linked) {
+              if (!Array.isArray(group.adminAccountIds)) group.adminAccountIds = [];
+              if (!group.adminAccountIds.includes(linked.id)) group.adminAccountIds.push(linked.id);
+            }
           }
         }
         if (event.action === 'demote') {
-          group.adminIds = group.adminIds.filter((number) => !changedNumbers.includes(number));
+          group.adminIds = (group.adminIds || []).filter(
+            (adminId) => !changed.some((identity) => identityMatches(adminId, identity))
+          );
+          for (const identity of changed) {
+            const member = group.members.find((item) => identityMatches(item, identity));
+            if (member) member.isAdmin = false;
+            const linked = this.db.data.accounts.find((item) => identityMatches(item, identity));
+            if (linked) {
+              group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== linked.id);
+            }
+          }
         }
         group.memberCount = group.members.length;
         group.lastSyncedAt = new Date().toISOString();
-        group.hasError = group.adminIds.length === 0;
+        group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
         this.db.save();
         this.emit('groups:update');
         this.refreshGroup(group.id).catch(() => {});
@@ -406,7 +472,18 @@ class SessionManager extends EventEmitter {
     } catch (error) {
       console.error('Failed to clear old session:', error);
     }
+    const previousIdentity = identitySummary(account);
     account.phoneNumber = '';
+    account.whatsappId = '';
+    account.whatsappJid = '';
+    account.whatsappLid = '';
+    for (const group of this.db.data.groups) {
+      group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
+      group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, previousIdentity));
+      group.members = (group.members || []).filter((member) => !identityMatches(member, previousIdentity));
+      group.memberCount = group.members.length;
+      group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
+    }
     account.status = 'disconnected';
     account.needsRelink = false;
     account.pendingOnboarding = true;
@@ -448,12 +525,10 @@ class SessionManager extends EventEmitter {
     this.db.data.accounts = this.db.data.accounts.filter((item) => item.id !== accountId);
     for (const group of this.db.data.groups) {
       group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
-      if (account.phoneNumber) {
-        group.adminIds = (group.adminIds || []).filter((number) => number !== account.phoneNumber);
-        group.members = (group.members || []).filter((member) => member.phoneNumber !== account.phoneNumber);
-        group.memberCount = group.members.length;
-      }
-      group.hasError = group.adminIds.length === 0;
+      group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, account));
+      group.members = (group.members || []).filter((member) => !identityMatches(member, account));
+      group.memberCount = group.members.length;
+      group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
     }
     this.db.data.contacts = this.db.data.contacts.map((contact) => ({
       ...contact,
@@ -469,10 +544,10 @@ class SessionManager extends EventEmitter {
     if (!Array.isArray(contacts)) return;
     let changed = false;
     for (const contact of contacts) {
-      const phone = phoneFromJid(contact.id);
-      if (!phone) continue;
+      const identity = participantIdentity(contact, contact);
+      if (!identity.id) continue;
       const name = contact.name || contact.notify || contact.verifiedName || '';
-      this.db.upsertContact(phone, name, accountId);
+      this.db.upsertContactIdentity(identity, name, accountId);
       changed = true;
     }
     if (changed) {
@@ -489,11 +564,11 @@ class SessionManager extends EventEmitter {
       const groups = await entry.sock.groupFetchAllParticipating();
       for (const metadata of Object.values(groups || {})) {
         for (const participant of metadata.participants || []) {
-          const phone = phoneFromJid(participant.id);
-          if (!phone) continue;
+          const identity = participantIdentity(participant, participant);
+          if (!identity.id) continue;
           const name = participant.name || participant.notify || '';
           if (name) {
-            this.db.upsertContact(phone, name, accountId);
+            this.db.upsertContactIdentity(identity, name, accountId);
             count += 1;
           }
         }
@@ -526,19 +601,26 @@ class SessionManager extends EventEmitter {
     const groups = await entry.sock.groupFetchAllParticipating();
     const result = [];
     for (const metadata of Object.values(groups || {})) {
-      const me = (metadata.participants || []).find(
-        (participant) => phoneFromJid(participant.id) === account.phoneNumber
-      );
-      for (const participant of metadata.participants || []) {
-        const phone = phoneFromJid(participant.id);
+      const participants = metadata.participants || [];
+      const matchingParticipants = participants.filter((participant) => identityMatches(participant, account));
+      const me = matchingParticipants.find((participant) => participantIsAdmin(participant)) || matchingParticipants[0];
+      if (!me && account) {
+        console.info('[identity] connected account was not found in group participants', {
+          groupId: metadata.id,
+          addressingMode: metadata.addressingMode,
+          account: identitySummary(account)
+        });
+      }
+      for (const participant of participants) {
+        const identity = participantIdentity(participant, participant);
         const name = participant.name || participant.notify || '';
-        if (phone && name) this.db.upsertContact(phone, name, accountId);
+        if (identity.id && name) this.db.upsertContactIdentity(identity, name, accountId);
       }
       result.push({
         id: metadata.id,
         name: metadata.subject || 'Unnamed group',
-        memberCount: (metadata.participants || []).length,
-        isAdmin: Boolean(me && me.admin),
+        memberCount: participants.length,
+        isAdmin: participantIsAdmin(me),
         alreadyManaged: this.db.data.groups.some((group) => group.id === metadata.id)
       });
     }
@@ -549,36 +631,71 @@ class SessionManager extends EventEmitter {
 
   applyMetadataToGroup(group, metadata, account, markAdmin) {
     const participants = metadata.participants || [];
-    const previousMembers = new Map((group.members || []).map((member) => [member.phoneNumber, member]));
+    const previousMembers = new Map();
+    for (const member of group.members || []) {
+      for (const key of identityKeys(member)) {
+        if (!previousMembers.has(key)) previousMembers.set(key, member);
+      }
+    }
+
     const members = participants.map((participant) => {
-      const phone = phoneFromJid(participant.id);
-      const previous = previousMembers.get(phone);
-      const name = participant.name || participant.notify || this.db.contactName(phone) || '';
-      if (phone && name && name !== phone) this.db.upsertContact(phone, name, account ? account.id : null);
+      const identity = participantIdentity(participant, participant);
+      let previous = null;
+      for (const key of identityKeys(identity)) {
+        if (previousMembers.has(key)) {
+          previous = previousMembers.get(key);
+          break;
+        }
+      }
+      const name = participant.name || participant.notify || this.db.contactName(identity) || '';
+      if (identity.id && name && name !== identity.phoneNumber) {
+        this.db.upsertContactIdentity(identity, name, account ? account.id : null);
+      }
       return {
-        phoneNumber: phone,
+        ...identity,
         displayName: name || (previous && previous.displayName) || '',
+        isAdmin: participantIsAdmin(participant),
+        isSuperAdmin: participantIsSuperAdmin(participant),
         joinedViaApp: previous ? previous.joinedViaApp : true,
         addedAt: previous ? previous.addedAt : new Date().toISOString()
       };
-    }).filter((member) => member.phoneNumber);
+    });
 
-    const adminIds = participants
-      .filter((participant) => participant.admin)
-      .map((participant) => phoneFromJid(participant.id))
-      .filter(Boolean);
+    const adminIdentities = participants
+      .filter((participant) => participantIsAdmin(participant))
+      .map((participant) => participantIdentity(participant, participant))
+      .filter((identity) => identity.id);
+    const adminIds = [];
+    const seenAdmins = new Set();
+    for (const identity of adminIdentities) {
+      if (!seenAdmins.has(identity.id)) {
+        seenAdmins.add(identity.id);
+        adminIds.push(identity.id);
+      }
+    }
 
     group.name = metadata.subject || group.name;
+    if (metadata.desc !== undefined) group.description = metadata.desc || '';
+    group.addressingMode = metadata.addressingMode || group.addressingMode;
     group.memberCount = members.length;
     group.members = members;
     group.adminIds = adminIds;
     group.lastSyncedAt = new Date().toISOString();
     group.adminAccountIds = (group.adminAccountIds || []).filter((id) => {
       const linked = this.db.findAccount(id);
-      return linked && linked.phoneNumber && adminIds.includes(linked.phoneNumber);
+      return Boolean(
+        linked &&
+        adminIdentities.some((identity) => identityMatches(linked, identity))
+      );
     });
-    if (markAdmin && account && account.phoneNumber && adminIds.includes(account.phoneNumber)) {
-      if (!group.adminAccountIds.includes(account.id)) group.adminAccountIds.push(account.id);
+    if (
+      markAdmin &&
+      account &&
+      adminIdentities.some((identity) => identityMatches(account, identity)) &&
+      !(group.adminAccountIds || []).includes(account.id)
+    ) {
+      if (!Array.isArray(group.adminAccountIds)) group.adminAccountIds = [];
+      group.adminAccountIds.push(account.id);
     }
     group.hasError = adminIds.length === 0;
   }
@@ -632,15 +749,12 @@ class SessionManager extends EventEmitter {
     const candidates = this.db.data.accounts.filter((account) => {
       const entry = this.sockets.get(account.id);
       if (!entry || !entry.connected) return false;
-      return (
-        group.adminIds.includes(account.phoneNumber) ||
-        (group.members || []).some((member) => member.phoneNumber === account.phoneNumber) ||
-        group.adminAccountIds.includes(account.id)
-      );
+      if (this.isAdminOf(account, group)) return true;
+      return (group.members || []).some((member) => identityMatches(member, account));
     });
     candidates.sort((a, b) => {
-      const aAdmin = group.adminIds.includes(a.phoneNumber) ? 1 : 0;
-      const bAdmin = group.adminIds.includes(b.phoneNumber) ? 1 : 0;
+      const aAdmin = this.isAdminOf(a, group) ? 1 : 0;
+      const bAdmin = this.isAdminOf(b, group) ? 1 : 0;
       return bAdmin - aAdmin;
     });
     if (candidates.length === 0) {
@@ -672,7 +786,7 @@ class SessionManager extends EventEmitter {
     const account = this.db.findAccount(accountId);
     if (!account) return;
     const groups = this.db.data.groups.filter(
-      (group) => group.adminAccountIds.includes(accountId) || group.adminIds.includes(account.phoneNumber)
+      (group) => (group.adminAccountIds || []).includes(accountId) || this.isAdminOf(account, group)
     );
     for (const group of groups) {
       try {
@@ -684,37 +798,64 @@ class SessionManager extends EventEmitter {
     this.emit('groups:update');
   }
 
-  async sendAction(accountId, groupJid, numbers, action) {
+  async sendAction(accountId, groupJid, targets, action) {
     const entry = this.sockets.get(accountId);
     const account = this.db.findAccount(accountId);
     if (!entry || !entry.connected) throw new Error('Account is disconnected.');
     if (!account) throw new Error('Account not found.');
-    const jids = numbers.map((number) => `${String(number).replace(/\D/g, '')}@s.whatsapp.net`);
+    if (!Array.isArray(targets) || targets.length === 0) {
+      throw new Error('No WhatsApp recipients were provided.');
+    }
+
+    const jids = targets.map((target) => {
+      const raw = typeof target === 'string'
+        ? target
+        : (target && (target.jid || target.id || target.number));
+      const text = raw === null || raw === undefined ? '' : String(raw).trim();
+      if (!text) return null;
+      if (text.includes('@')) {
+        const jid = normalizeJid(text);
+        return isPnJid(jid) || isLidJid(jid) ? jid : null;
+      }
+      return jidFromPhone(text) || null;
+    });
+    if (jids.some((jid) => !jid)) {
+      throw new Error('Invalid WhatsApp recipient identity. Use a phone number or a WhatsApp JID.');
+    }
+
     const results = await entry.sock.groupParticipantsUpdate(groupJid, jids, action);
     if (!Array.isArray(results)) {
-      return numbers.map((number) => ({ number, status: 200 }));
+      return targets.map((target, index) => ({
+        number: targetLabel(target),
+        jid: jids[index],
+        status: 200
+      }));
     }
-    return results.map((result, index) => ({
-      number: phoneFromJid(result.jid) || numbers[index],
-      status: result.status,
-      content: result.content
-    }));
+    return results.map((result, index) => {
+      const numericStatus = Number(result.status);
+      return {
+        number: phoneFromJid(result.jid) || targetLabel(targets[index]),
+        jid: normalizeJid(result.jid) || jids[index],
+        status: Number.isFinite(numericStatus) ? numericStatus : result.status,
+        content: result.content
+      };
+    });
   }
 
   async findGroupAdminSocket(group, excludeAccountId) {
     const candidates = this.db.data.accounts.filter((account) => {
       if (account.id === excludeAccountId) return false;
       const entry = this.sockets.get(account.id);
-      return entry && entry.connected && group.adminIds.includes(account.phoneNumber);
+      return entry && entry.connected && this.isAdminOf(account, group);
     });
     for (const account of candidates) {
       const entry = this.sockets.get(account.id);
       try {
         const metadata = await entry.sock.groupMetadata(group.id);
         const me = (metadata.participants || []).find(
-          (participant) => phoneFromJid(participant.id) === account.phoneNumber
+          (participant) => identityMatches(participant, account)
         );
-        if (me && me.admin) return { account, sock: entry.sock, metadata };
+        if (participantIsAdmin(me)) return { account, sock: entry.sock, metadata };
       } catch (error) {
         continue;
       }
@@ -724,7 +865,7 @@ class SessionManager extends EventEmitter {
 
   async onboardAccount(accountId) {
     const account = this.db.findAccount(accountId);
-    if (!account || !account.pendingOnboarding || !account.phoneNumber) return;
+    if (!account || !account.pendingOnboarding) return;
     if (this.onboarding.has(accountId)) return;
     const entry = this.sockets.get(accountId);
     if (!entry || !entry.connected) return;
@@ -734,36 +875,43 @@ class SessionManager extends EventEmitter {
       const groups = [...this.db.data.groups];
       for (const group of groups) {
         try {
-          if (group.adminIds.includes(account.phoneNumber)) {
+          if (this.isAdminOf(account, group)) {
+            if (!Array.isArray(group.adminAccountIds)) group.adminAccountIds = [];
             if (!group.adminAccountIds.includes(accountId)) group.adminAccountIds.push(accountId);
             continue;
           }
           const admin = await this.findGroupAdminSocket(group, accountId);
           if (!admin) throw new Error('No connected admin account is available to promote this account.');
           const isMember = (admin.metadata.participants || []).some(
-            (participant) => phoneFromJid(participant.id) === account.phoneNumber
+            (participant) => identityMatches(participant, account)
           );
           if (!isMember) {
             const code = await admin.sock.groupInviteCode(group.id);
             await entry.sock.groupAcceptInvite(code);
             await sleep(2500);
           }
+          const targetJid = preferredAccountJid(account, {
+            ...group,
+            addressingMode: admin.metadata.addressingMode || group.addressingMode
+          });
+          if (!targetJid) throw new Error('This account has no usable WhatsApp identity for promotion.');
           let promoted = false;
           for (let attempt = 0; attempt < 3 && !promoted; attempt += 1) {
             try {
-              await admin.sock.groupParticipantsUpdate(
-                group.id,
-                [`${account.phoneNumber}@s.whatsapp.net`],
-                'promote'
-              );
+              await admin.sock.groupParticipantsUpdate(group.id, [targetJid], 'promote');
               promoted = true;
             } catch (error) {
               await sleep(2000);
             }
           }
           if (!promoted) throw new Error('WhatsApp did not allow the promotion step.');
+          if (!Array.isArray(group.adminAccountIds)) group.adminAccountIds = [];
           if (!group.adminAccountIds.includes(accountId)) group.adminAccountIds.push(accountId);
-          if (!group.adminIds.includes(account.phoneNumber)) group.adminIds.push(account.phoneNumber);
+          if (!group.adminIds.some((adminId) => identityMatches(adminId, targetJid))) {
+            group.adminIds.push(targetJid);
+          }
+          const promotedMember = group.members.find((member) => identityMatches(member, targetJid));
+          if (promotedMember) promotedMember.isAdmin = true;
           group.hasError = group.adminIds.length === 0;
           await this.refreshGroup(group.id).catch(() => {});
           this.db.save();
@@ -804,7 +952,7 @@ class SessionManager extends EventEmitter {
     for (const account of this.db.data.accounts) {
       const entry = this.sockets.get(account.id);
       if (!entry || !entry.connected) continue;
-      if (!group.adminIds.includes(account.phoneNumber) && !group.adminAccountIds.includes(account.id)) continue;
+      if (!this.isAdminOf(account, group)) continue;
       try {
         return await entry.sock.groupInviteCode(groupId);
       } catch (error) {

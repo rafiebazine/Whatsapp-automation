@@ -1,6 +1,15 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const {
+  normalizeJid,
+  phoneDigits,
+  phoneFromJid,
+  jidFromPhone,
+  participantIdentity,
+  identityKeys,
+  normalizeAdminId
+} = require('./identity');
 
 const DEFAULT_SETTINGS = {
   dailyCap: 20,
@@ -17,7 +26,7 @@ const DEFAULT_SETTINGS = {
 
 function defaultData() {
   return {
-    version: 1,
+    version: 2,
     auth: null,
     settings: { ...DEFAULT_SETTINGS },
     accounts: [],
@@ -39,7 +48,7 @@ class Database {
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       if (fs.existsSync(this.filePath)) {
         const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-        this.data = {
+        this.data = migrateData({
           ...defaultData(),
           ...parsed,
           settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) },
@@ -48,7 +57,8 @@ class Database {
           contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
           jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
           logs: Array.isArray(parsed.logs) ? parsed.logs : []
-        };
+        });
+        this.save();
       } else {
         this.save();
       }
@@ -102,6 +112,9 @@ class Database {
       id,
       alias,
       phoneNumber: '',
+      whatsappId: '',
+      whatsappJid: '',
+      whatsappLid: '',
       authFolder: id,
       status: 'disconnected',
       dailyActionCount: 0,
@@ -144,33 +157,219 @@ class Database {
     }
   }
 
-  upsertContact(phoneNumber, name, accountId) {
-    if (!phoneNumber || phoneNumber.length < 6) return;
-    const cleanName = (name || '').trim();
-    let contact = this.data.contacts.find((item) => item.phoneNumber === phoneNumber);
-    if (!contact) {
-      contact = {
-        phoneNumber,
-        name: cleanName,
-        sourceAccounts: accountId ? [accountId] : [],
-        lastSyncedAt: new Date().toISOString()
-      };
-      this.data.contacts.push(contact);
-    } else {
-      if (cleanName && (!contact.name || /^\+?\d+$/.test(contact.name))) {
-        contact.name = cleanName;
+  findContact(value) {
+    const keys = identityKeys(value);
+    if (!keys.size) return null;
+    return this.data.contacts.find((contact) => {
+      const contactKeys = identityKeys(contact);
+      for (const key of contactKeys) {
+        if (keys.has(key)) return true;
       }
-      if (accountId && !contact.sourceAccounts.includes(accountId)) {
-        contact.sourceAccounts.push(accountId);
-      }
-      contact.lastSyncedAt = new Date().toISOString();
-    }
+      return false;
+    }) || null;
   }
 
-  contactName(phoneNumber) {
-    const contact = this.data.contacts.find((item) => item.phoneNumber === phoneNumber);
+  upsertContact(phoneNumber, name, accountId) {
+    return this.upsertContactIdentity({ phoneNumber }, name, accountId);
+  }
+
+  upsertContactIdentity(identity, name, accountId) {
+    const normalized = participantIdentity(identity, identity);
+    if (!normalized.id && !normalized.phoneNumber) return null;
+    const cleanName = (name || '').trim();
+    const now = new Date().toISOString();
+    let contact = this.findContact(normalized);
+    if (!contact) {
+      contact = {
+        id: normalized.id || jidFromPhone(normalized.phoneNumber),
+        jid: normalized.jid || '',
+        lid: normalized.lid || '',
+        phoneNumber: normalized.phoneNumber || '',
+        name: cleanName,
+        sourceAccounts: accountId ? [accountId] : [],
+        lastSyncedAt: now
+      };
+      this.data.contacts.push(contact);
+      return contact;
+    }
+
+    if (!contact.id) contact.id = normalized.id || jidFromPhone(normalized.phoneNumber);
+    if (!contact.jid && normalized.jid) contact.jid = normalized.jid;
+    if (!contact.lid && normalized.lid) contact.lid = normalized.lid;
+    if (!contact.phoneNumber && normalized.phoneNumber) contact.phoneNumber = normalized.phoneNumber;
+    if (cleanName && (!contact.name || /^\+?\d+$/.test(contact.name))) {
+      contact.name = cleanName;
+    }
+    if (!Array.isArray(contact.sourceAccounts)) contact.sourceAccounts = [];
+    if (accountId && !contact.sourceAccounts.includes(accountId)) {
+      contact.sourceAccounts.push(accountId);
+    }
+    contact.lastSyncedAt = now;
+    return contact;
+  }
+
+  contactName(value) {
+    const contact = this.findContact(value);
     return contact && contact.name ? contact.name : '';
   }
 }
 
-module.exports = { Database, DEFAULT_SETTINGS };
+function mergeSourceAccounts(target, source) {
+  if (!Array.isArray(target.sourceAccounts)) target.sourceAccounts = [];
+  for (const accountId of source.sourceAccounts || []) {
+    if (accountId && !target.sourceAccounts.includes(accountId)) target.sourceAccounts.push(accountId);
+  }
+}
+
+function migrateAccount(account) {
+  if (!account || typeof account !== 'object') return account;
+  account.whatsappId = normalizeJid(account.whatsappId) || '';
+  account.whatsappJid = normalizeJid(account.whatsappJid) || '';
+  account.whatsappLid = normalizeJid(account.whatsappLid) || '';
+  account.phoneNumber = phoneDigits(account.phoneNumber) || '';
+
+  if (account.whatsappId) {
+    if (!account.whatsappJid && account.whatsappId.endsWith('@s.whatsapp.net')) {
+      account.whatsappJid = account.whatsappId;
+    }
+    if (!account.whatsappLid && account.whatsappId.endsWith('@lid')) {
+      account.whatsappLid = account.whatsappId;
+    }
+  }
+  if (!account.whatsappJid && account.phoneNumber) {
+    account.whatsappJid = jidFromPhone(account.phoneNumber);
+  }
+  if (!account.whatsappId) {
+    account.whatsappId = account.whatsappJid || account.whatsappLid;
+  }
+  if (!account.phoneNumber && account.whatsappJid) {
+    account.phoneNumber = phoneFromJid(account.whatsappJid);
+  }
+  return account;
+}
+
+function migrateMember(member) {
+  if (!member || typeof member !== 'object') return member;
+  const identity = participantIdentity(member, member);
+  member.id = identity.id;
+  member.jid = identity.jid;
+  member.lid = identity.lid;
+  member.phoneNumber = identity.phoneNumber;
+  member.displayName = member.displayName || member.name || member.notify || '';
+  member.isAdmin = Boolean(member.isAdmin);
+  member.isSuperAdmin = Boolean(member.isSuperAdmin);
+  member.joinedViaApp = member.joinedViaApp !== false;
+  member.addedAt = member.addedAt || new Date().toISOString();
+  return member;
+}
+
+function migrateGroup(group) {
+  if (!group || typeof group !== 'object') return group;
+  const members = Array.isArray(group.members) ? group.members.map(migrateMember) : [];
+  const legacyAdminIds = [];
+  const legacyAdminKeys = new Set();
+  for (const raw of group.adminIds || []) {
+    const adminId = normalizeAdminId(raw);
+    if (!adminId) continue;
+    legacyAdminIds.push(adminId);
+    for (const key of identityKeys(adminId)) legacyAdminKeys.add(key);
+  }
+
+  for (const member of members) {
+    if (member.isAdmin) continue;
+    const keys = identityKeys(member);
+    member.isAdmin = Array.from(keys).some((key) => legacyAdminKeys.has(key));
+  }
+
+  const adminIds = [];
+  const seenAdminKeys = new Set();
+  for (const member of members) {
+    if (!member.isAdmin || !member.id) continue;
+    const keys = identityKeys(member);
+    if (Array.from(keys).some((key) => seenAdminKeys.has(key))) continue;
+    adminIds.push(member.id);
+    for (const key of keys) seenAdminKeys.add(key);
+  }
+  for (const adminId of legacyAdminIds) {
+    const keys = identityKeys(adminId);
+    if (Array.from(keys).some((key) => seenAdminKeys.has(key))) continue;
+    adminIds.push(adminId);
+    for (const key of keys) seenAdminKeys.add(key);
+  }
+
+  group.members = members;
+  group.memberCount = members.length;
+  group.adminIds = adminIds;
+  group.adminAccountIds = Array.isArray(group.adminAccountIds) ? group.adminAccountIds : [];
+  group.addressingMode = group.addressingMode === 'lid' ? 'lid' : group.addressingMode === 'pn' ? 'pn' : group.addressingMode;
+  group.hasError = adminIds.length === 0 && !members.some((member) => member.isAdmin);
+  return group;
+}
+
+function migrateContacts(contacts) {
+  const migrated = [];
+  const byKey = new Map();
+  for (const raw of contacts || []) {
+    if (!raw || typeof raw !== 'object') continue;
+    const contact = { ...raw };
+    const identity = participantIdentity(contact, contact);
+    contact.id = identity.id || contact.id || '';
+    contact.jid = identity.jid || '';
+    contact.lid = identity.lid || '';
+    contact.phoneNumber = identity.phoneNumber || phoneDigits(contact.phoneNumber) || '';
+    contact.name = contact.name || '';
+    if (!contact.id && contact.phoneNumber) contact.id = jidFromPhone(contact.phoneNumber);
+    if (!contact.id) continue;
+
+    const keys = identityKeys(contact);
+    let existing = null;
+    for (const key of keys) {
+      if (byKey.has(key)) {
+        existing = byKey.get(key);
+        break;
+      }
+    }
+    if (!existing) {
+      existing = contact;
+      migrated.push(existing);
+    } else {
+      if (!existing.jid && contact.jid) existing.jid = contact.jid;
+      if (!existing.lid && contact.lid) existing.lid = contact.lid;
+      if (!existing.phoneNumber && contact.phoneNumber) existing.phoneNumber = contact.phoneNumber;
+      if (contact.name && (!existing.name || /^\+?\d+$/.test(existing.name))) existing.name = contact.name;
+      mergeSourceAccounts(existing, contact);
+    }
+    for (const key of identityKeys(existing)) byKey.set(key, existing);
+  }
+  return migrated;
+}
+
+function migrateTarget(target) {
+  if (!target || typeof target !== 'object') return target;
+  const raw = target.jid || target.number || '';
+  if (String(raw).includes('@')) {
+    const jid = normalizeJid(raw);
+    if (jid) target.jid = jid;
+    if (!target.number || String(target.number).includes('@')) {
+      target.number = phoneFromJid(jid) || jid;
+    }
+  }
+  return target;
+}
+
+function migrateData(data) {
+  if (!data || typeof data !== 'object') return data;
+  data.version = Math.max(2, Number(data.version) || 1);
+  data.accounts = Array.isArray(data.accounts) ? data.accounts.map(migrateAccount) : [];
+  data.groups = Array.isArray(data.groups) ? data.groups.map(migrateGroup) : [];
+  data.contacts = migrateContacts(data.contacts);
+  data.jobs = Array.isArray(data.jobs)
+    ? data.jobs.map((job) => ({
+      ...job,
+      targets: Array.isArray(job.targets) ? job.targets.map(migrateTarget) : []
+    }))
+    : [];
+  return data;
+}
+
+module.exports = { Database, DEFAULT_SETTINGS, migrateData };

@@ -10,7 +10,8 @@
     "start": "electron .",
     "dev": "electron . --dev",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder --win"
+    "dist": "electron-builder --win",
+    "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.24",

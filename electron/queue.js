@@ -1,6 +1,14 @@
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
 const { friendlyError, normalizePhone } = require('./session-manager');
+const {
+  normalizeJid,
+  isPnJid,
+  isLidJid,
+  phoneFromJid,
+  jidFromPhone,
+  identityKeys
+} = require('./identity');
 
 const ACTIVE_STATUSES = new Set(['queued', 'running']);
 const FINISHED_TARGET = new Set(['success', 'failed', 'skipped']);
@@ -15,6 +23,45 @@ function parseClock(value, fallback) {
   const hours = Math.min(23, Math.max(0, Number(match[1])));
   const minutes = Math.min(59, Math.max(0, Number(match[2])));
   return hours * 60 + minutes;
+}
+
+function normalizeTarget(raw) {
+  if (raw === null || raw === undefined) return null;
+  let value = raw;
+  let name = '';
+  if (typeof raw === 'object') {
+    value = raw.jid || raw.id || raw.number;
+    name = String(raw.name || '').trim();
+  }
+  const text = value === null || value === undefined ? '' : String(value).trim();
+  if (!text) return null;
+  if (text.includes('@')) {
+    const jid = normalizeJid(text);
+    if (!isPnJid(jid) && !isLidJid(jid)) return null;
+    const phone = phoneFromJid(jid);
+    return { jid, number: phone || jid, name, key: jid };
+  }
+  const phone = normalizePhone(text);
+  if (!phone) return null;
+  const jid = jidFromPhone(phone);
+  return { jid, number: phone, name, key: jid || phone };
+}
+
+function targetKey(target) {
+  if (!target) return '';
+  const raw = typeof target === 'string'
+    ? target
+    : (target.jid || target.number || target.id);
+  const normalized = normalizeTarget(raw);
+  return normalized ? normalized.key : String(raw || '');
+}
+
+function memberKeysFor(group) {
+  const keys = new Set();
+  for (const member of group.members || []) {
+    for (const key of identityKeys(member)) keys.add(key);
+  }
+  return keys;
 }
 
 class QueueManager extends EventEmitter {
@@ -140,7 +187,7 @@ class QueueManager extends EventEmitter {
     });
     if (connectedAdmins.length === 0) {
       const anyAdminAccount = this.db.data.accounts.some(
-        (account) => group.adminAccountIds.includes(account.id) || group.adminIds.includes(account.phoneNumber)
+        (account) => (group.adminAccountIds || []).includes(account.id) || this.sessions.isAdminOf(account, group)
       );
       return anyAdminAccount
         ? 'No admin account for this group is currently connected.'
@@ -240,7 +287,11 @@ class QueueManager extends EventEmitter {
   }
 
   classifyResult(result, type) {
-    const status = result && result.status;
+    const rawStatus = result && result.status;
+    const status = Number(rawStatus);
+    if (!Number.isFinite(status)) {
+      return { status: 'failed', error: `WhatsApp returned status ${rawStatus}.` };
+    }
     if (status === 200) {
       return { status: 'success', error: null };
     }
@@ -296,7 +347,7 @@ class QueueManager extends EventEmitter {
       const results = await this.sessions.sendAction(
         account.id,
         group.id,
-        [target.number],
+        [target],
         job.type === 'add' ? 'add' : 'remove'
       );
       if (!Array.isArray(results) || results.length === 0) {
@@ -441,59 +492,66 @@ class QueueManager extends EventEmitter {
     this.emit('groups:update');
   }
 
-  createJob({ type, groupId, numbers, names }) {
+  createJob({ type, groupId, numbers, names, targets: requestedTargets }) {
     if (type !== 'add' && type !== 'remove') throw new Error('Unknown job type.');
     const group = this.db.findGroup(groupId);
     if (!group) throw new Error('Group not found.');
-    if (!Array.isArray(numbers) || numbers.length === 0) throw new Error('No numbers were provided.');
+    const inputs = Array.isArray(requestedTargets) && requestedTargets.length
+      ? requestedTargets
+      : (Array.isArray(numbers) ? numbers : []);
+    if (inputs.length === 0) throw new Error('No recipients were provided.');
 
     const settings = this.getSettings();
     const normalized = [];
     const seen = new Set();
-    for (const raw of numbers) {
-      const phone = normalizePhone(raw);
-      if (!phone || seen.has(phone)) continue;
-      seen.add(phone);
-      normalized.push(phone);
+    for (const raw of inputs) {
+      const target = normalizeTarget(raw);
+      if (!target || seen.has(target.key)) continue;
+      seen.add(target.key);
+      normalized.push(target);
     }
-    if (normalized.length === 0) throw new Error('No valid phone numbers were provided.');
+    if (normalized.length === 0) {
+      throw new Error('No valid phone numbers or WhatsApp identities were provided.');
+    }
 
-    const memberNumbers = new Set((group.members || []).map((member) => member.phoneNumber));
+    const memberKeys = memberKeysFor(group);
     const pendingTargets = new Set();
     for (const job of this.db.data.jobs) {
       if (job.groupId !== groupId || job.type !== type) continue;
       if (!ACTIVE_STATUSES.has(job.status)) continue;
       for (const target of job.targets || []) {
         if (target.status === 'pending' || target.status === 'running') {
-          pendingTargets.add(target.number);
+          const key = targetKey(target);
+          if (key) pendingTargets.add(key);
         }
       }
     }
 
-    const filtered = normalized.filter((phone) => {
-      if (pendingTargets.has(phone)) return false;
-      if (type === 'add') return !memberNumbers.has(phone);
-      return memberNumbers.has(phone);
+    const filtered = normalized.filter((target) => {
+      if (pendingTargets.has(target.key)) return false;
+      if (type === 'add') return !memberKeys.has(target.key);
+      return memberKeys.has(target.key);
     });
     if (filtered.length === 0) {
       throw new Error(
         type === 'add'
-          ? 'No new valid numbers to add. They may already be in the group or queued.'
-          : 'None of these numbers are currently in the group.'
+          ? 'No new valid recipients to add. They may already be in the group or queued.'
+          : 'None of these recipients are currently in the group.'
       );
     }
 
     const nameMap = new Map();
     if (names && typeof names === 'object') {
       for (const key of Object.keys(names)) {
-        const phone = normalizePhone(key);
-        if (phone) nameMap.set(phone, String(names[key] || '').trim());
+        const normalizedKey = normalizeTarget(key);
+        if (normalizedKey) nameMap.set(normalizedKey.key, String(names[key] || '').trim());
       }
     }
 
-    const targets = filtered.map((number) => ({
-      number,
-      name: nameMap.get(number) || this.db.contactName(number.replace('+', '')) || '',
+    const targets = filtered.map((target) => ({
+      number: target.number,
+      jid: target.jid || '',
+      name: target.name || nameMap.get(target.key) || this.db.contactName(target.jid || target.number) || '',
       status: 'pending',
       error: null,
       accountId: null,
@@ -506,7 +564,7 @@ class QueueManager extends EventEmitter {
       type,
       groupId,
       groupName: group.name,
-      targetNumbers: filtered,
+      targetNumbers: targets.map((target) => target.number),
       targets,
       status: 'queued',
       createdAt: new Date().toISOString(),

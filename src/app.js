@@ -83,7 +83,7 @@ function esc(value) {
 function normalizePhone(value) {
   if (value === null || value === undefined) return '';
   let text = String(value).trim();
-  if (!text) return '';
+  if (!text || text.includes('@')) return '';
   text = text.replace(/[\s\-().]/g, '');
   if (text.startsWith('00')) text = `+${text.slice(2)}`;
   const hasPlus = text.startsWith('+');
@@ -92,6 +92,68 @@ function normalizePhone(value) {
   if (!hasPlus && digits.length < 8) return '';
   if (digits.length < 8 || digits.length > 15) return '';
   return `+${digits}`;
+}
+
+function normalizeIdentityJid(value) {
+  const text = String(value || '').trim();
+  if (!text.includes('@')) return '';
+  const at = text.indexOf('@');
+  let user = text.slice(0, at);
+  const device = user.indexOf(':');
+  if (device >= 0) user = user.slice(0, device);
+  const agent = user.indexOf('_');
+  if (agent >= 0) user = user.slice(0, agent);
+  if (!user) return '';
+  const server = text.slice(at + 1).toLowerCase();
+  return `${user}@${server === 'c.us' ? 's.whatsapp.net' : server}`;
+}
+
+function identityInput(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+  if (text.includes('@')) {
+    const jid = normalizeIdentityJid(text);
+    if (!jid || (!jid.endsWith('@lid') && !jid.endsWith('@s.whatsapp.net'))) return null;
+    const digits = jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0].replace(/\D/g, '') : '';
+    const phone = digits.length >= 8 && digits.length <= 15 ? `+${digits}` : '';
+    return { jid, phone, number: phone || jid, key: jid };
+  }
+  const phone = normalizePhone(text);
+  if (!phone) return null;
+  const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+  return { jid, phone, number: phone, key: jid };
+}
+
+function memberIdentityKeys(member) {
+  const keys = new Set();
+  for (const value of [member && member.id, member && member.jid, member && member.lid, member && member.phoneNumber]) {
+    if (!value) continue;
+    const text = String(value);
+    if (text.includes('@')) {
+      const jid = normalizeIdentityJid(text);
+      if (jid) keys.add(jid);
+    } else {
+      const phone = normalizePhone(text);
+      if (phone) keys.add(`${phone.replace(/\D/g, '')}@s.whatsapp.net`);
+    }
+  }
+  return keys;
+}
+
+function memberLabel(member) {
+  return (member && (member.displayName || member.phoneNumber || member.id)) || 'Unknown member';
+}
+
+function memberSubLabel(member) {
+  return (member && (member.phoneNumber || member.id || member.jid || member.lid)) || '';
+}
+
+function isMemberAdmin(adminIds, member) {
+  const keys = memberIdentityKeys(member);
+  return (adminIds || []).some((value) => {
+    const target = identityInput(value);
+    return Boolean(target && keys.has(target.key));
+  });
 }
 
 function avatarColor(seed) {
@@ -108,9 +170,9 @@ function avatar(name, id, sizeClass = '') {
   return `<div class="avatar ${sizeClass}" style="background:${avatarColor(id || name)}">${esc(label)}</div>`;
 }
 
-function formatPhone(phone) {
-  if (!phone) return 'Not linked';
-  return esc(phone);
+function formatAccountIdentity(account) {
+  const value = account && (account.phoneNumber || account.whatsappJid || account.whatsappLid || account.whatsappId);
+  return value ? esc(value) : 'Not linked';
 }
 
 function formatDuration(seconds) {
@@ -524,7 +586,7 @@ function accountSelectCard(account, selected) {
       ${avatar(account.alias, account.id)}
       <div class="row-main">
         <div class="row-title">${esc(account.alias)} <span class="badge ${meta.tone}">${meta.label}</span></div>
-        <div class="row-subtitle">${formatPhone(account.phoneNumber)}</div>
+        <div class="row-subtitle">${formatAccountIdentity(account)}</div>
       </div>
       <div class="row-trailing">${selected ? icon('checkCircle', 20) : icon('chevron', 18)}</div>
     </button>`;
@@ -720,10 +782,10 @@ function renderGroupPage() {
     ? members.length
       ? `<div class="list">${members.map((member) => `
         <div class="list-row">
-          ${avatar(member.displayName || member.phoneNumber, member.phoneNumber, 'sm')}
+          ${avatar(memberLabel(member), member.id || member.phoneNumber, 'sm')}
           <div class="row-main">
-            <div class="row-title">${esc(member.displayName || member.phoneNumber)} ${adminIds.includes(member.phoneNumber) ? '<span class="member-admin">Admin</span>' : ''}</div>
-            <div class="row-subtitle">${esc(member.phoneNumber)}</div>
+            <div class="row-title">${esc(memberLabel(member))} ${isMemberAdmin(adminIds, member) ? '<span class="member-admin">Admin</span>' : ''}</div>
+            <div class="row-subtitle">${esc(memberSubLabel(member))}</div>
           </div>
         </div>`).join('')}</div>`
       : `<div class="card empty-state"><div class="empty-icon">${icon('users', 30)}</div><h3>No members found</h3><p>Refresh the group to fetch its current member list from WhatsApp.</p></div>`
@@ -824,7 +886,7 @@ async function openMembers(mode) {
     context: null,
     pending: [],
     pendingSet: new Set(),
-    memberSet: new Set(),
+    memberKeys: new Set(),
     busy: false,
     importing: false,
     groupName: group.name
@@ -836,8 +898,11 @@ async function openMembers(mode) {
     ctx.context = context;
     ctx.loading = false;
     ctx.groupName = context.group.name;
-    ctx.memberSet = new Set((context.group.members || []).map((member) => member.phoneNumber));
-    ctx.pendingSet = new Set((context.pendingNumbers || []).map(normalizePhone).filter(Boolean));
+    ctx.memberKeys = new Set();
+    for (const member of context.group.members || []) {
+      for (const key of memberIdentityKeys(member)) ctx.memberKeys.add(key);
+    }
+    ctx.pendingSet = new Set((context.pendingNumbers || []).map(identityInput).filter(Boolean).map((item) => item.key));
   } catch (error) {
     const ctx = state.pageData.members;
     ctx.loading = false;
@@ -846,24 +911,26 @@ async function openMembers(mode) {
   if (state.page === 'members') renderMembersPage();
 }
 
-function memberNameFor(ctx, phone) {
+function memberNameFor(ctx, raw) {
   const group = ctx.context ? ctx.context.group : null;
   if (!group) return '';
-  const member = (group.members || []).find((item) => item.phoneNumber === phone);
-  return member ? member.displayName || '' : '';
+  const target = identityInput(raw);
+  if (!target) return '';
+  const member = (group.members || []).find((item) => memberIdentityKeys(item).has(target.key));
+  return member ? memberLabel(member) : '';
 }
 
 function addPendingNumber(raw, rawName) {
   const ctx = state.pageData.members;
   if (!ctx) return 'invalid';
-  const phone = normalizePhone(raw);
-  if (!phone) return 'invalid';
-  if (ctx.mode === 'add' && ctx.memberSet.has(phone)) return 'in-group';
-  if (ctx.mode === 'remove' && !ctx.memberSet.has(phone)) return 'not-member';
-  if (ctx.pendingSet.has(phone)) return 'duplicate';
-  const name = String(rawName || '').trim() || memberNameFor(ctx, phone);
-  ctx.pending.push({ number: phone, name });
-  ctx.pendingSet.add(phone);
+  const target = identityInput(raw);
+  if (!target) return 'invalid';
+  if (ctx.mode === 'add' && ctx.memberKeys.has(target.key)) return 'in-group';
+  if (ctx.mode === 'remove' && !ctx.memberKeys.has(target.key)) return 'not-member';
+  if (ctx.pendingSet.has(target.key)) return 'duplicate';
+  const name = String(rawName || '').trim() || memberNameFor(ctx, raw);
+  ctx.pending.push({ number: target.number, jid: target.jid, name, key: target.key });
+  ctx.pendingSet.add(target.key);
   return 'added';
 }
 
@@ -964,7 +1031,7 @@ function renderMembersPage() {
     button.addEventListener('click', () => {
       const index = Number(button.getAttribute('data-remove-pending'));
       const [removed] = ctx.pending.splice(index, 1);
-      if (removed) ctx.pendingSet.delete(removed.number);
+      if (removed) ctx.pendingSet.delete(removed.key || removed.number);
       renderMembersPage();
     });
   });
@@ -1032,7 +1099,8 @@ function renderMembersPage() {
         type: ctx.mode,
         groupId,
         numbers: ctx.pending.map((item) => item.number),
-        names
+        names,
+        targets: ctx.pending.map((item) => ({ number: item.number, jid: item.jid, name: item.name }))
       }]);
       showToast('Job queued. It will run with delayed, rotated actions.', 'success');
       openGroup(groupId);
@@ -1103,7 +1171,7 @@ function accountRow(account) {
       ${avatar(account.alias, account.id)}
       <div class="account-info">
         <div class="account-name">${esc(account.alias)} <span class="badge ${meta.tone}"><span class="dot-status ${meta.dot}"></span>${meta.label}</span></div>
-        <div class="account-detail">${formatPhone(account.phoneNumber)} · ${usage}</div>
+        <div class="account-detail">${formatAccountIdentity(account)} · ${usage}</div>
         ${extras.filter(Boolean).map((text) => `<div class="account-detail"><span class="${account.needsRelink ? 'error-text' : ''}">${text}</span></div>`).join('')}
       </div>
       <div class="account-actions">
@@ -1407,7 +1475,10 @@ function renderContactRows() {
     if (!query) return true;
     return (
       (contact.name || '').toLowerCase().includes(query) ||
-      (contact.phoneNumber || '').toLowerCase().includes(query)
+      (contact.phoneNumber || '').toLowerCase().includes(query) ||
+      (contact.id || '').toLowerCase().includes(query) ||
+      (contact.jid || '').toLowerCase().includes(query) ||
+      (contact.lid || '').toLowerCase().includes(query)
     );
   });
   if (!contacts.length) {
@@ -1419,10 +1490,10 @@ function renderContactRows() {
   }
   return `<div class="list">${contacts.map((contact) => `
     <div class="list-row">
-      ${avatar(contact.name || contact.phoneNumber, contact.phoneNumber, 'sm')}
+      ${avatar(contact.name || contact.phoneNumber || contact.id || contact.jid || contact.lid, contact.id || contact.phoneNumber || contact.jid || contact.lid, 'sm')}
       <div class="row-main">
         <div class="row-title">${esc(contact.name || 'Unknown contact')}</div>
-        <div class="row-subtitle">${esc(contact.phoneNumber)}</div>
+        <div class="row-subtitle">${esc(contact.phoneNumber || contact.id || contact.jid || contact.lid || '')}</div>
         ${contact.sourceAccounts && contact.sourceAccounts.length ? `<div class="contact-sources">${esc(contact.sourceAccounts.join(', '))}</div>` : ''}
       </div>
     </div>`).join('')}</div>`;
