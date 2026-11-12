@@ -22,6 +22,21 @@ const state = {
   booting: true
 };
 
+const {
+  normalizePhone,
+  formatPhone,
+  normalizeJid,
+  isPnJid,
+  isLidJid,
+  jidFromPhone,
+  identityKeys,
+  identityMatches,
+  getContactDisplayName,
+  getMemberKey,
+  hasActiveJobsForGroup,
+  sanitizeContactName
+} = window.WGMIdentity;
+
 const AVATAR_COLORS = [
   '#128C7E',
   '#1F9D8B',
@@ -80,80 +95,35 @@ function esc(value) {
     .replace(/'/g, '&#39;');
 }
 
-function normalizePhone(value) {
-  if (value === null || value === undefined) return '';
-  let text = String(value).trim();
-  if (!text || text.includes('@')) return '';
-  text = text.replace(/[\s\-().]/g, '');
-  if (text.startsWith('00')) text = `+${text.slice(2)}`;
-  const hasPlus = text.startsWith('+');
-  const digits = text.replace(/\D/g, '');
-  if (!digits) return '';
-  if (!hasPlus && digits.length < 8) return '';
-  if (digits.length < 8 || digits.length > 15) return '';
-  return `+${digits}`;
-}
-
-function normalizeIdentityJid(value) {
-  const text = String(value || '').trim();
-  if (!text.includes('@')) return '';
-  const at = text.indexOf('@');
-  let user = text.slice(0, at);
-  const device = user.indexOf(':');
-  if (device >= 0) user = user.slice(0, device);
-  const agent = user.indexOf('_');
-  if (agent >= 0) user = user.slice(0, agent);
-  if (!user) return '';
-  const server = text.slice(at + 1).toLowerCase();
-  return `${user}@${server === 'c.us' ? 's.whatsapp.net' : server}`;
-}
-
 function identityInput(raw) {
   const text = String(raw || '').trim();
   if (!text) return null;
   if (text.includes('@')) {
-    const jid = normalizeIdentityJid(text);
-    if (!jid || (!jid.endsWith('@lid') && !jid.endsWith('@s.whatsapp.net'))) return null;
-    const digits = jid.endsWith('@s.whatsapp.net') ? jid.split('@')[0].replace(/\D/g, '') : '';
-    const phone = digits.length >= 8 && digits.length <= 15 ? `+${digits}` : '';
+    const jid = normalizeJid(text);
+    if (!jid || (!isPnJid(jid) && !isLidJid(jid))) return null;
+    const phone = isPnJid(jid) ? formatPhone(jid.split('@')[0]) : '';
     return { jid, phone, number: phone || jid, key: jid };
   }
   const phone = normalizePhone(text);
   if (!phone) return null;
-  const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+  const jid = jidFromPhone(phone);
   return { jid, phone, number: phone, key: jid };
 }
 
 function memberIdentityKeys(member) {
-  const keys = new Set();
-  for (const value of [member && member.id, member && member.jid, member && member.lid, member && member.phoneNumber]) {
-    if (!value) continue;
-    const text = String(value);
-    if (text.includes('@')) {
-      const jid = normalizeIdentityJid(text);
-      if (jid) keys.add(jid);
-    } else {
-      const phone = normalizePhone(text);
-      if (phone) keys.add(`${phone.replace(/\D/g, '')}@s.whatsapp.net`);
-    }
-  }
-  return keys;
+  return identityKeys(member);
 }
 
 function memberLabel(member) {
-  return (member && (member.displayName || member.phoneNumber || member.id)) || 'Unknown member';
+  return getContactDisplayName(member, 'Unknown contact');
 }
 
 function memberSubLabel(member) {
-  return (member && (member.phoneNumber || member.id || member.jid || member.lid)) || '';
+  return formatPhone(member && member.phoneNumber) || 'Phone number unavailable';
 }
 
 function isMemberAdmin(adminIds, member) {
-  const keys = memberIdentityKeys(member);
-  return (adminIds || []).some((value) => {
-    const target = identityInput(value);
-    return Boolean(target && keys.has(target.key));
-  });
+  return (adminIds || []).some((value) => identityMatches(value, member));
 }
 
 function avatarColor(seed) {
@@ -171,8 +141,11 @@ function avatar(name, id, sizeClass = '') {
 }
 
 function formatAccountIdentity(account) {
-  const value = account && (account.phoneNumber || account.whatsappJid || account.whatsappLid || account.whatsappId);
-  return value ? esc(value) : 'Not linked';
+  if (!account) return 'Not linked';
+  const phone = formatPhone(account.phoneNumber);
+  if (phone) return esc(phone);
+  if (account.whatsappJid || account.whatsappLid || account.whatsappId) return 'Linked via WhatsApp';
+  return 'Not linked';
 }
 
 function formatDuration(seconds) {
@@ -347,8 +320,10 @@ function jobCard(job) {
         ${metaRight}
       </div>
       <div class="job-actions">
-        ${job.errors && job.errors.length ? `<button class="btn btn-ghost" data-job-errors="${esc(job.id)}">${icon('alert', 14)} View ${job.errors.length} error${job.errors.length === 1 ? '' : 's'}</button>` : ''}
-        ${!active ? `<button class="btn btn-ghost" data-job-dismiss="${esc(job.id)}">Dismiss</button>` : ''}
+        <div class="job-errors">
+          ${job.errors && job.errors.length ? `<button class="btn btn-ghost" data-job-errors="${esc(job.id)}">${icon('alert', 14)} View ${job.errors.length} error${job.errors.length === 1 ? '' : 's'}</button>` : ''}
+        </div>
+        ${!active ? `<button class="btn btn-close" data-job-dismiss="${esc(job.id)}">${icon('x', 13)} Close</button>` : ''}
       </div>
     </div>`;
 }
@@ -506,9 +481,6 @@ function renderLogin() {
 
 function renderHome() {
   state.page = 'home';
-  const activeJobs = state.jobs.filter((job) => job.status === 'queued' || job.status === 'running');
-  const recentJobs = state.jobs.filter((job) => job.status !== 'queued' && job.status !== 'running');
-  const jobsToShow = [...activeJobs, ...recentJobs].slice(0, 6);
   const online = state.accounts.filter((account) => account.status === 'connected').length;
   const groups = state.groups.slice().sort((a, b) => a.name.localeCompare(b.name));
 
@@ -521,7 +493,7 @@ function renderHome() {
           <div class="row-subtitle">${group.memberCount} member${group.memberCount === 1 ? '' : 's'}${group.adminAccountIds && group.adminAccountIds.length ? ` · ${group.adminAccountIds.length} admin account${group.adminAccountIds.length === 1 ? '' : 's'}` : ''}</div>
         </div>
         <div class="row-trailing">
-          ${group.hasOngoingAction ? `<span class="clock" title="Job in progress">${icon('clock', 19)}</span>` : ''}
+          ${hasActiveJobsForGroup(state.jobs, group.id) ? `<span class="clock" title="Job in progress">${icon('clock', 19)}</span>` : ''}
           ${group.hasError ? `<span class="alert" title="Needs attention">${icon('alert', 19)}</span>` : ''}
           ${icon('chevron', 19)}
         </div>
@@ -542,9 +514,7 @@ function renderHome() {
         <div class="status-line">
           <span class="pill"><span class="dot-status ${online ? 'connected' : 'disconnected'}"></span>${online} of ${state.accounts.length} account${state.accounts.length === 1 ? '' : 's'} online</span>
           <span class="pill">${state.groups.length} group${state.groups.length === 1 ? '' : 's'} managed</span>
-          ${activeJobs.length ? `<span class="pill"><span class="dot-status connected"></span>${activeJobs.length} active job${activeJobs.length === 1 ? '' : 's'}</span>` : ''}
         </div>
-        ${jobsToShow.length ? `<div class="job-stack">${jobsToShow.map(jobCard).join('')}</div>` : ''}
         <div class="page-head">
           <div>
             <h2>Your groups</h2>
@@ -563,7 +533,6 @@ function renderHome() {
   document.querySelectorAll('[data-group-id]').forEach((row) => {
     row.addEventListener('click', () => openGroup(row.getAttribute('data-group-id')));
   });
-  bindJobActions();
 }
 
 function openAddGroup() {
@@ -886,7 +855,10 @@ async function openMembers(mode) {
     context: null,
     pending: [],
     pendingSet: new Set(),
+    importedFiles: [],
     memberKeys: new Set(),
+    selectedMemberKeys: new Set(),
+    memberSearch: '',
     busy: false,
     importing: false,
     groupName: group.name
@@ -902,7 +874,10 @@ async function openMembers(mode) {
     for (const member of context.group.members || []) {
       for (const key of memberIdentityKeys(member)) ctx.memberKeys.add(key);
     }
-    ctx.pendingSet = new Set((context.pendingNumbers || []).map(identityInput).filter(Boolean).map((item) => item.key));
+    const pendingInputs = Array.isArray(context.pendingTargets)
+      ? context.pendingTargets.map((item) => item.jid || item.number)
+      : (context.pendingNumbers || []);
+    ctx.pendingSet = new Set(pendingInputs.map(identityInput).filter(Boolean).map((item) => item.key));
   } catch (error) {
     const ctx = state.pageData.members;
     ctx.loading = false;
@@ -917,10 +892,10 @@ function memberNameFor(ctx, raw) {
   const target = identityInput(raw);
   if (!target) return '';
   const member = (group.members || []).find((item) => memberIdentityKeys(item).has(target.key));
-  return member ? memberLabel(member) : '';
+  return member ? getContactDisplayName(member, '') : '';
 }
 
-function addPendingNumber(raw, rawName) {
+function addPendingNumber(raw, rawName, source) {
   const ctx = state.pageData.members;
   if (!ctx) return 'invalid';
   const target = identityInput(raw);
@@ -928,8 +903,16 @@ function addPendingNumber(raw, rawName) {
   if (ctx.mode === 'add' && ctx.memberKeys.has(target.key)) return 'in-group';
   if (ctx.mode === 'remove' && !ctx.memberKeys.has(target.key)) return 'not-member';
   if (ctx.pendingSet.has(target.key)) return 'duplicate';
-  const name = String(rawName || '').trim() || memberNameFor(ctx, raw);
-  ctx.pending.push({ number: target.number, jid: target.jid, name, key: target.key });
+  const name = sanitizeContactName(rawName) || memberNameFor(ctx, raw);
+  ctx.pending.push({
+    number: target.number,
+    jid: target.jid,
+    phoneNumber: target.phone || '',
+    name,
+    key: target.key,
+    source: source || { type: 'manual' },
+    sourceFileId: source && source.type === 'file' ? source.fileId : ''
+  });
   ctx.pendingSet.add(target.key);
   return 'added';
 }
@@ -956,6 +939,41 @@ function membersBack() {
   }
 }
 
+function memberPickerMembers(ctx) {
+  const group = ctx.context ? ctx.context.group : null;
+  const members = group && Array.isArray(group.members) ? group.members : [];
+  const query = (ctx.memberSearch || '').toLowerCase();
+  return members.filter((member) => {
+    const key = getMemberKey(member);
+    if (!key || ctx.pendingSet.has(key)) return false;
+    if (!query) return true;
+    return (
+      (memberLabel(member) || '').toLowerCase().includes(query) ||
+      (formatPhone(member.phoneNumber) || '').toLowerCase().includes(query)
+    );
+  });
+}
+
+function renderMemberPicker(ctx) {
+  const members = memberPickerMembers(ctx);
+  if (!members.length) {
+    return `<div class="member-picker-empty">${ctx.memberSearch ? 'No matching members.' : 'All group members are already in the pending list.'}</div>`;
+  }
+  return members.map((member) => {
+    const key = getMemberKey(member);
+    const selected = ctx.selectedMemberKeys.has(key);
+    return `
+      <button type="button" class="member-pick-row ${selected ? 'selected' : ''}" data-member-pick="${esc(key)}">
+        ${avatar(memberLabel(member), key, 'xs')}
+        <div class="row-main">
+          <div class="row-title">${esc(memberLabel(member))}</div>
+          <div class="row-subtitle">${esc(formatPhone(member.phoneNumber) || 'Phone number unavailable')}</div>
+        </div>
+        <span class="pick-check">${selected ? icon('check', 14) : ''}</span>
+      </button>`;
+  }).join('');
+}
+
 function renderMembersPage() {
   const ctx = state.pageData.members;
   if (!ctx) {
@@ -979,37 +997,84 @@ function renderMembersPage() {
     </div>`;
   } else {
     const pendingMarkup = ctx.pending.length
-      ? `<div class="card pending-list">${ctx.pending.map((item, index) => `
+      ? `<div class="card pending-list">${ctx.pending.map((item, index) => {
+        const phone = formatPhone(item.phoneNumber);
+        const title = item.name || phone || 'Unknown contact';
+        const subtitle = phone || 'Phone number unavailable';
+        const showSubtitle = subtitle !== title;
+        return `
         <div class="pending-row">
-          ${avatar(item.name || item.number, item.number, 'xs')}
+          ${avatar(title, item.key || item.number, 'xs')}
           <div>
-            <div class="num">${esc(item.number)}</div>
-            ${item.name ? `<div class="name">${esc(item.name)}</div>` : ''}
+            <div class="num">${esc(title)}</div>
+            ${showSubtitle ? `<div class="name">${esc(subtitle)}</div>` : ''}
+            ${item.source && item.source.type !== 'manual' ? `<div class="source">${esc(item.source.label || item.source.fileName || '')}</div>` : ''}
           </div>
           <button class="remove" data-remove-pending="${index}" aria-label="Remove number">${icon('x', 17)}</button>
-        </div>`).join('')}</div>`
+        </div>`;
+      }).join('')}</div>`
       : `<div class="card empty-state" style="padding:30px 20px">
           <div class="empty-icon" style="width:48px;height:48px;border-radius:15px;margin-bottom:10px">${icon('user', 22)}</div>
-          <h3 style="font-size:15px">No numbers yet</h3>
-          <p>Import a spreadsheet or add a number above. Invalid, duplicate, or ${ctx.mode === 'add' ? 'already-member' : 'non-member'} numbers are ignored.</p>
+          <h3 style="font-size:15px">No recipients yet</h3>
+          <p>Import spreadsheets or add a number above. Invalid, duplicate, or ${ctx.mode === 'add' ? 'already-member' : 'non-member'} numbers are ignored.</p>
         </div>`;
+
+    const pickerMarkup = ctx.mode === 'remove'
+      ? `<div class="card member-picker">
+          <div class="member-picker-head">
+            <div>
+              <h4>Select from group</h4>
+              <p>Search the current member list and add people to the pending removal list.</p>
+            </div>
+            <span class="count" id="member-picker-count">${ctx.selectedMemberKeys.size} selected</span>
+          </div>
+          <div class="member-picker-search">
+            <div class="search-wrap">
+              ${icon('search', 16)}
+              <input id="member-picker-search" class="input" type="text" placeholder="Search members" value="${esc(ctx.memberSearch || '')}" autocomplete="off">
+            </div>
+          </div>
+          <div class="member-picker-actions">
+            <button class="btn btn-ghost btn-sm" id="select-visible" type="button">Select all visible</button>
+            <button class="btn btn-ghost btn-sm" id="clear-selection" type="button" ${ctx.selectedMemberKeys.size ? '' : 'disabled'}>Clear</button>
+          </div>
+          <div class="member-picker-list" id="member-picker-list">${renderMemberPicker(ctx)}</div>
+          <button class="btn btn-secondary btn-block" id="add-selected" type="button" ${ctx.selectedMemberKeys.size ? '' : 'disabled'}>
+            Add selected (${ctx.selectedMemberKeys.size})
+          </button>
+        </div>`
+      : '';
+
+    const filesMarkup = ctx.importedFiles && ctx.importedFiles.length
+      ? `<div class="import-files">${ctx.importedFiles.map((file) => `
+        <div class="import-file-row">
+          <div class="import-file-icon">${icon('file', 17)}</div>
+          <div class="import-file-main">
+            <strong>${esc(file.name)}</strong>
+            <span>${file.added} added · ${file.stats.valid} valid${file.stats.invalid ? ` · ${file.stats.invalid} invalid` : ''}${file.stats.duplicate ? ` · ${file.stats.duplicate} duplicate` : ''}</span>
+          </div>
+          <button class="icon-btn small" data-remove-file="${esc(file.id)}" aria-label="Remove imported file">${icon('x', 17)}</button>
+        </div>`).join('')}</div>`
+      : '';
 
     body = `
       <div class="import-zone">
         <div class="import-icon">${icon('upload', 22)}</div>
         <div>
-          <h4>Import from Excel</h4>
-          <p>.xlsx or .csv · two columns in order: number, then name</p>
+          <h4>Import from Excel or CSV</h4>
+          <p>.xlsx or .csv · first column number or WhatsApp JID, second column name</p>
         </div>
-        <button class="btn btn-secondary" id="import-button" ${ctx.importing ? 'disabled' : ''}>${ctx.importing ? 'Reading…' : 'Choose file'}</button>
-        <input id="import-file" type="file" accept=".xlsx,.xls,.csv" class="hidden">
+        <button class="btn btn-secondary" id="import-button" ${ctx.importing ? 'disabled' : ''}>${ctx.importing ? 'Reading…' : 'Choose files'}</button>
+        <input id="import-file" type="file" accept=".xlsx,.csv" multiple class="hidden">
       </div>
+      ${filesMarkup}
       <form class="manual-add" id="manual-form">
         <input id="manual-number" class="input" type="text" placeholder="Add one number, e.g. +212612345678" autocomplete="off">
         <button class="btn btn-primary" type="submit" id="manual-submit" aria-label="Add number">${icon('plus', 22)}</button>
       </form>
+      ${pickerMarkup}
       <div class="pending-head">
-        <h3>Pending numbers</h3>
+        <h3>Pending recipients</h3>
         <span class="count">${ctx.pending.length} ready</span>
       </div>
       ${pendingMarkup}
@@ -1036,6 +1101,17 @@ function renderMembersPage() {
     });
   });
 
+  document.querySelectorAll('[data-remove-file]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const fileId = button.getAttribute('data-remove-file');
+      const removed = ctx.pending.filter((item) => item.sourceFileId === fileId);
+      ctx.pending = ctx.pending.filter((item) => item.sourceFileId !== fileId);
+      for (const item of removed) ctx.pendingSet.delete(item.key || item.number);
+      ctx.importedFiles = (ctx.importedFiles || []).filter((file) => file.id !== fileId);
+      renderMembersPage();
+    });
+  });
+
   if (ctx.error) {
     const retry = document.getElementById('retry-members');
     if (retry) retry.addEventListener('click', () => openMembers(ctx.mode));
@@ -1043,29 +1119,116 @@ function renderMembersPage() {
   }
   if (ctx.loading) return;
 
+  if (ctx.mode === 'remove') {
+    const bindPickerRows = () => {
+      document.querySelectorAll('[data-member-pick]').forEach((button) => {
+        button.addEventListener('click', () => {
+          const key = button.getAttribute('data-member-pick');
+          if (ctx.selectedMemberKeys.has(key)) ctx.selectedMemberKeys.delete(key);
+          else ctx.selectedMemberKeys.add(key);
+          updatePicker();
+        });
+      });
+    };
+    const updatePicker = () => {
+      const list = document.getElementById('member-picker-list');
+      if (list) list.innerHTML = renderMemberPicker(ctx);
+      const count = document.getElementById('member-picker-count');
+      if (count) count.textContent = `${ctx.selectedMemberKeys.size} selected`;
+      const addSelected = document.getElementById('add-selected');
+      if (addSelected) {
+        addSelected.disabled = ctx.selectedMemberKeys.size === 0;
+        addSelected.textContent = `Add selected (${ctx.selectedMemberKeys.size})`;
+      }
+      const clear = document.getElementById('clear-selection');
+      if (clear) clear.disabled = ctx.selectedMemberKeys.size === 0;
+      bindPickerRows();
+    };
+    bindPickerRows();
+
+    const search = document.getElementById('member-picker-search');
+    search.addEventListener('input', () => {
+      ctx.memberSearch = search.value;
+      updatePicker();
+    });
+
+    document.getElementById('select-visible').addEventListener('click', () => {
+      for (const member of memberPickerMembers(ctx)) {
+        const key = getMemberKey(member);
+        if (key) ctx.selectedMemberKeys.add(key);
+      }
+      updatePicker();
+    });
+
+    document.getElementById('clear-selection').addEventListener('click', () => {
+      ctx.selectedMemberKeys.clear();
+      updatePicker();
+    });
+
+    document.getElementById('add-selected').addEventListener('click', () => {
+      const group = ctx.context ? ctx.context.group : null;
+      const members = group && Array.isArray(group.members) ? group.members : [];
+      let added = 0;
+      for (const key of Array.from(ctx.selectedMemberKeys)) {
+        const member = members.find((item) => getMemberKey(item) === key);
+        if (!member) continue;
+        const raw = member.jid || member.lid || member.phoneNumber;
+        if (!raw) continue;
+        const name = getContactDisplayName(member, '');
+        if (addPendingNumber(raw, name, { type: 'group-selection', label: 'Selected from group' }) === 'added') {
+          added += 1;
+        }
+      }
+      ctx.selectedMemberKeys.clear();
+      renderMembersPage();
+      if (added > 0) showToast(`${added} member${added === 1 ? '' : 's'} added to the pending list.`, 'success');
+    });
+  }
+
   const importButton = document.getElementById('import-button');
   const importFile = document.getElementById('import-file');
   importButton.addEventListener('click', () => importFile.click());
   importFile.addEventListener('change', async () => {
-    const file = importFile.files && importFile.files[0];
-    if (!file) return;
+    const files = Array.from(importFile.files || []);
+    if (!files.length) return;
     ctx.importing = true;
     renderMembersPage();
-    try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const parsed = await call('import:parse', [file.name, bytes], { silent: true });
-      let added = 0;
-      for (const row of parsed.rows) {
-        if (addPendingNumber(row.number, row.name) === 'added') added += 1;
+    let totalAdded = 0;
+    let totalInvalid = 0;
+    const failures = [];
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const parsed = await call('import:parse', [file.name, bytes], { silent: true });
+        const fileId = `file_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 8)}`;
+        const source = { type: 'file', fileId, fileName: file.name, label: file.name };
+        let added = 0;
+        for (const row of parsed.rows) {
+          if (addPendingNumber(row.number, row.name, source) === 'added') added += 1;
+        }
+        totalAdded += added;
+        totalInvalid += (parsed.stats && parsed.stats.invalid) || 0;
+        ctx.importedFiles.push({
+          id: fileId,
+          name: file.name,
+          stats: parsed.stats || { valid: parsed.rows.length, invalid: 0, duplicate: 0 },
+          added
+        });
+      } catch (error) {
+        failures.push(`${file.name}: ${error.message}`);
       }
-      ctx.importing = false;
-      renderMembersPage();
-      if (added > 0) showToast(`${added} number${added === 1 ? '' : 's'} added to the list.`, 'success');
-      else showToast('No new valid numbers were found in this file.', 'info');
-    } catch (error) {
-      ctx.importing = false;
-      renderMembersPage();
-      showToast(error.message, 'error');
+    }
+    ctx.importing = false;
+    renderMembersPage();
+    importFile.value = '';
+    if (failures.length) {
+      showToast(failures[0], 'error');
+    } else if (totalAdded > 0) {
+      const skipped = totalInvalid ? ` ${totalInvalid} invalid row${totalInvalid === 1 ? '' : 's'} skipped.` : '';
+      showToast(`${totalAdded} recipient${totalAdded === 1 ? '' : 's'} added.${skipped}`, 'success');
+    } else {
+      showToast('No new valid recipients were found in the selected files.', 'info');
     }
   });
 
@@ -1474,11 +1637,9 @@ function renderContactRows() {
   const contacts = state.contacts.filter((contact) => {
     if (!query) return true;
     return (
-      (contact.name || '').toLowerCase().includes(query) ||
-      (contact.phoneNumber || '').toLowerCase().includes(query) ||
-      (contact.id || '').toLowerCase().includes(query) ||
-      (contact.jid || '').toLowerCase().includes(query) ||
-      (contact.lid || '').toLowerCase().includes(query)
+      (contact.displayName || contact.name || '').toLowerCase().includes(query) ||
+      (contact.phoneLabel || contact.phoneNumber || '').toLowerCase().includes(query) ||
+      (contact.sourceAccounts || []).join(' ').toLowerCase().includes(query)
     );
   });
   if (!contacts.length) {
@@ -1490,10 +1651,10 @@ function renderContactRows() {
   }
   return `<div class="list">${contacts.map((contact) => `
     <div class="list-row">
-      ${avatar(contact.name || contact.phoneNumber || contact.id || contact.jid || contact.lid, contact.id || contact.phoneNumber || contact.jid || contact.lid, 'sm')}
+      ${avatar(contact.displayName || contact.phoneLabel || '?', contact.id || contact.phoneNumber, 'sm')}
       <div class="row-main">
-        <div class="row-title">${esc(contact.name || 'Unknown contact')}</div>
-        <div class="row-subtitle">${esc(contact.phoneNumber || contact.id || contact.jid || contact.lid || '')}</div>
+        <div class="row-title">${esc(contact.displayName || 'Unknown contact')}</div>
+        <div class="row-subtitle">${esc(contact.phoneLabel || 'Phone number unavailable')}</div>
         ${contact.sourceAccounts && contact.sourceAccounts.length ? `<div class="contact-sources">${esc(contact.sourceAccounts.join(', '))}</div>` : ''}
       </div>
     </div>`).join('')}</div>`;
@@ -1544,7 +1705,11 @@ function renderContacts() {
       state.contacts = result.contacts;
       state.contactsCount = result.count;
       document.getElementById('contacts-list-container').innerHTML = renderContactRows();
-      showToast(`${result.count} contact${result.count === 1 ? '' : 's'} synced.`, 'success');
+      if (result.failed && result.failed.length) {
+        showToast(`Contacts updated, but ${result.failed.length} account${result.failed.length === 1 ? '' : 's'} failed to sync.`, 'error');
+      } else {
+        showToast(`${result.synced || 0} contact${result.synced === 1 ? '' : 's'} synced across ${state.accounts.filter((account) => account.status === 'connected').length} account${state.accounts.filter((account) => account.status === 'connected').length === 1 ? '' : 's'}.`, 'success');
+      }
     } catch (error) {
       // Error toast is shown by call().
     } finally {
@@ -1687,7 +1852,9 @@ function openJobErrorsModal(job) {
     <div class="errors-list">
       ${rows.map((error) => {
         const account = error.accountId ? state.accounts.find((item) => item.id === error.accountId) : null;
-        return `<div class="error-item"><strong>${esc(error.number)}${error.name ? ` · ${esc(error.name)}` : ''}</strong>${esc(error.error)}${account ? `<div style="opacity:.75;margin-top:3px">Attempted by ${esc(account.alias)}</div>` : ''}</div>`;
+        const rawLabel = error.name || error.number || '';
+        const label = rawLabel.includes('@') ? 'Unknown contact' : (rawLabel || 'Unknown contact');
+        return `<div class="error-item"><strong>${esc(label)}</strong>${esc(error.error)}${account ? `<div style="opacity:.75;margin-top:3px">Attempted by ${esc(account.alias)}</div>` : ''}</div>`;
       }).join('')}
     </div>
     <div class="modal-actions">

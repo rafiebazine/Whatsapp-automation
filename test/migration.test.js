@@ -50,7 +50,7 @@ function legacyData() {
 
 test('migrates legacy phone data without losing LID members', () => {
   const data = migrateData(legacyData());
-  assert.equal(data.version, 2);
+  assert.equal(data.version, 3);
 
   const legacyGroup = data.groups[0];
   assert.deepEqual(legacyGroup.adminIds, ['212612345678@s.whatsapp.net']);
@@ -71,10 +71,17 @@ test('migrates legacy phone data without losing LID members', () => {
 
   assert.equal(data.contacts.length, 2);
   assert.equal(data.contacts[1].id, '222@lid');
+  assert.deepEqual(data.contacts[0].sourceTypes, ['group']);
+  assert.equal(data.contacts[0].nameSource, 'whatsapp');
 
   assert.equal(data.jobs[0].targets[0].status, 'pending');
+  assert.equal(data.jobs[0].targets[0].phoneNumber, '212699999999');
+  assert.equal(data.jobs[0].targets[0].number, '212699999999');
+  assert.equal(data.jobs[0].targets[0].displayName, '+212699999999');
   assert.equal(data.jobs[0].targets[1].status, 'running');
   assert.equal(data.jobs[0].targets[1].jid, '222@lid');
+  assert.equal(data.jobs[0].targets[1].phoneNumber, '');
+  assert.equal(data.jobs[0].targets[1].displayName, 'Unknown contact');
 });
 
 test('migration is idempotent', () => {

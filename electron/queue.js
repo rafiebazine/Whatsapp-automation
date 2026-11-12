@@ -7,7 +7,9 @@ const {
   isLidJid,
   phoneFromJid,
   jidFromPhone,
-  identityKeys
+  identityKeys,
+  formatPhone,
+  sanitizeContactName
 } = require('./identity');
 
 const ACTIVE_STATUSES = new Set(['queued', 'running']);
@@ -31,20 +33,35 @@ function normalizeTarget(raw) {
   let name = '';
   if (typeof raw === 'object') {
     value = raw.jid || raw.id || raw.number;
-    name = String(raw.name || '').trim();
+    name = sanitizeContactName(raw.displayName) || sanitizeContactName(raw.name);
   }
   const text = value === null || value === undefined ? '' : String(value).trim();
   if (!text) return null;
   if (text.includes('@')) {
     const jid = normalizeJid(text);
     if (!isPnJid(jid) && !isLidJid(jid)) return null;
-    const phone = phoneFromJid(jid);
-    return { jid, number: phone || jid, name, key: jid };
+    const phoneNumber = phoneFromJid(jid);
+    return {
+      jid,
+      phoneNumber,
+      number: phoneNumber ? formatPhone(phoneNumber) : jid,
+      name,
+      displayName: name || formatPhone(phoneNumber) || 'Unknown contact',
+      key: jid
+    };
   }
   const phone = normalizePhone(text);
   if (!phone) return null;
   const jid = jidFromPhone(phone);
-  return { jid, number: phone, name, key: jid || phone };
+  const phoneNumber = phone.replace(/\D/g, '');
+  return {
+    jid,
+    phoneNumber,
+    number: phone,
+    name,
+    displayName: name || phone,
+    key: jid || phone
+  };
 }
 
 function targetKey(target) {
@@ -369,7 +386,7 @@ class QueueManager extends EventEmitter {
       }
       this.db.addLog({
         jobId: job.id,
-        numberOrAction: target.number,
+        numberOrAction: target.displayName || target.name || target.number,
         accountUsed: account.alias,
         result: outcome.status === 'success' ? 'success' : outcome.status,
         errorMessage: outcome.error || null
@@ -394,7 +411,7 @@ class QueueManager extends EventEmitter {
       }
       this.db.addLog({
         jobId: job.id,
-        numberOrAction: target.number,
+        numberOrAction: target.displayName || target.name || target.number,
         accountUsed: account.alias,
         result: 'failure',
         errorMessage: message
@@ -436,8 +453,9 @@ class QueueManager extends EventEmitter {
     job.errors = targets
       .filter((target) => target.status === 'failed')
       .map((target) => ({
-        number: target.number,
-        name: target.name || '',
+        number: target.displayName || target.name || target.number,
+        name: target.displayName || target.name || '',
+        phoneNumber: target.phoneNumber || '',
         error: target.error || 'Unknown error',
         accountId: target.accountId || null
       }));
@@ -544,20 +562,26 @@ class QueueManager extends EventEmitter {
     if (names && typeof names === 'object') {
       for (const key of Object.keys(names)) {
         const normalizedKey = normalizeTarget(key);
-        if (normalizedKey) nameMap.set(normalizedKey.key, String(names[key] || '').trim());
+        if (normalizedKey) nameMap.set(normalizedKey.key, sanitizeContactName(names[key]));
       }
     }
 
-    const targets = filtered.map((target) => ({
-      number: target.number,
-      jid: target.jid || '',
-      name: target.name || nameMap.get(target.key) || this.db.contactName(target.jid || target.number) || '',
-      status: 'pending',
-      error: null,
-      accountId: null,
-      processedAt: null,
-      attempts: 0
-    }));
+    const targets = filtered.map((target) => {
+      const name = target.name || nameMap.get(target.key) || this.db.contactName(target.jid || target.number) || '';
+      const displayName = name || target.displayName || 'Unknown contact';
+      return {
+        number: target.number,
+        phoneNumber: target.phoneNumber || '',
+        jid: target.jid || '',
+        name: displayName,
+        displayName,
+        status: 'pending',
+        error: null,
+        accountId: null,
+        processedAt: null,
+        attempts: 0
+      };
+    });
 
     const job = {
       id: `job_${crypto.randomUUID()}`,
@@ -644,8 +668,9 @@ class QueueManager extends EventEmitter {
       job.errors = (job.targets || [])
         .filter((target) => target.status === 'failed')
         .map((target) => ({
-          number: target.number,
-          name: target.name || '',
+          number: target.displayName || target.name || target.number,
+          name: target.displayName || target.name || '',
+          phoneNumber: target.phoneNumber || '',
           error: target.error || reason,
           accountId: target.accountId || null
         }));

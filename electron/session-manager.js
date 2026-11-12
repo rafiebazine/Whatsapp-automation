@@ -12,6 +12,8 @@ const {
   phoneDigits,
   phoneFromJid,
   jidFromPhone,
+  normalizePhone,
+  formatPhone,
   participantIdentity,
   identityKeys,
   identityMatches,
@@ -20,34 +22,28 @@ const {
   normalizeAdminId,
   accountIsAdminOfGroup,
   preferredAccountJid,
-  identitySummary
+  identitySummary,
+  sanitizeContactName,
+  getContactDisplayName
 } = require('./identity');
 
 const logger = pino({ level: 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function normalizePhone(value) {
-  if (value === null || value === undefined) return '';
-  let text = String(value).trim();
-  if (!text || text.includes('@')) return '';
-  text = text.replace(/[\s\-().]/g, '');
-  if (text.startsWith('00')) text = `+${text.slice(2)}`;
-  const hasPlus = text.startsWith('+');
-  const digits = text.replace(/\D/g, '');
-  if (!digits) return '';
-  if (!hasPlus && digits.length < 8) return '';
-  if (digits.length < 8 || digits.length > 15) return '';
-  return `+${digits}`;
-}
-
 function targetLabel(target) {
   if (target === null || target === undefined) return '';
   if (typeof target === 'string') return target;
-  return target.number || target.jid || target.id || '';
+  return target.displayName || target.name || formatPhone(target.phoneNumber) || target.number || target.jid || target.id || '';
+}
+
+function redactIdentityText(value) {
+  return String(value || '')
+    .replace(/[\w:.-]+@lid\b/gi, 'contact')
+    .replace(/[\w:.-]+@s\.whatsapp\.net\b/gi, 'contact');
 }
 
 function friendlyError(error) {
-  const text = (error && (error.message || error.toString())) || 'Unknown error';
+  const text = redactIdentityText((error && (error.message || error.toString())) || 'Unknown error');
   const lowered = text.toLowerCase();
   if (lowered.includes('timed out')) return 'WhatsApp did not respond in time. Please try again.';
   if (lowered.includes('connection closed')) return 'The WhatsApp connection closed. Reconnecting…';
@@ -546,8 +542,15 @@ class SessionManager extends EventEmitter {
     for (const contact of contacts) {
       const identity = participantIdentity(contact, contact);
       if (!identity.id) continue;
-      const name = contact.name || contact.notify || contact.verifiedName || '';
-      this.db.upsertContactIdentity(identity, name, accountId);
+      const nameSource = sanitizeContactName(contact.name)
+        ? 'whatsapp'
+        : sanitizeContactName(contact.notify)
+          ? 'notify'
+          : sanitizeContactName(contact.verifiedName)
+            ? 'verified'
+            : '';
+      const name = sanitizeContactName(contact.name) || sanitizeContactName(contact.notify) || sanitizeContactName(contact.verifiedName);
+      this.db.upsertContactIdentity(identity, name, accountId, 'contact', nameSource || 'whatsapp');
       changed = true;
     }
     if (changed) {
@@ -566,32 +569,41 @@ class SessionManager extends EventEmitter {
         for (const participant of metadata.participants || []) {
           const identity = participantIdentity(participant, participant);
           if (!identity.id) continue;
-          const name = participant.name || participant.notify || '';
-          if (name) {
-            this.db.upsertContactIdentity(identity, name, accountId);
-            count += 1;
-          }
+          const nameSource = sanitizeContactName(participant.name)
+            ? 'participant'
+            : sanitizeContactName(participant.notify)
+              ? 'notify'
+              : sanitizeContactName(participant.verifiedName)
+                ? 'verified'
+                : '';
+          const name = sanitizeContactName(participant.name) || sanitizeContactName(participant.notify) || sanitizeContactName(participant.verifiedName);
+          this.db.upsertContactIdentity(identity, name, accountId, 'group', nameSource || 'participant');
+          count += 1;
         }
       }
       this.db.save();
       this.emit('contacts:update');
     } catch (error) {
       console.error('Contact sync failed:', error);
+      throw error;
     }
     return count;
   }
 
   async refreshAllContacts() {
     let total = 0;
+    const failed = [];
     for (const account of this.db.data.accounts) {
+      if (account.status !== 'connected' && account.status !== 'paused') continue;
       try {
         total += await this.syncContacts(account.id);
       } catch (error) {
         console.error(`Contact refresh failed for ${account.alias}:`, error);
+        failed.push({ id: account.id, alias: account.alias, error: friendlyError(error) });
       }
     }
     this.emit('contacts:update');
-    return total;
+    return { total, failed };
   }
 
   async fetchGroups(accountId) {
@@ -613,8 +625,15 @@ class SessionManager extends EventEmitter {
       }
       for (const participant of participants) {
         const identity = participantIdentity(participant, participant);
-        const name = participant.name || participant.notify || '';
-        if (identity.id && name) this.db.upsertContactIdentity(identity, name, accountId);
+        const nameSource = sanitizeContactName(participant.name)
+          ? 'participant'
+          : sanitizeContactName(participant.notify)
+            ? 'notify'
+            : sanitizeContactName(participant.verifiedName)
+              ? 'verified'
+              : '';
+        const name = sanitizeContactName(participant.name) || sanitizeContactName(participant.notify) || sanitizeContactName(participant.verifiedName);
+        if (identity.id) this.db.upsertContactIdentity(identity, name, accountId, 'group', nameSource || 'participant');
       }
       result.push({
         id: metadata.id,
@@ -647,13 +666,20 @@ class SessionManager extends EventEmitter {
           break;
         }
       }
-      const name = participant.name || participant.notify || this.db.contactName(identity) || '';
-      if (identity.id && name && name !== identity.phoneNumber) {
-        this.db.upsertContactIdentity(identity, name, account ? account.id : null);
+      const contactName = this.db.contactName(identity);
+      const participantName = sanitizeContactName(participant.name) || sanitizeContactName(participant.notify) || sanitizeContactName(participant.verifiedName);
+      const name = contactName || participantName || '';
+      if (identity.id && participantName && !contactName) {
+        const nameSource = sanitizeContactName(participant.name)
+          ? 'participant'
+          : sanitizeContactName(participant.notify)
+            ? 'notify'
+            : 'verified';
+        this.db.upsertContactIdentity(identity, participantName, account ? account.id : null, 'group', nameSource);
       }
       return {
         ...identity,
-        displayName: name || (previous && previous.displayName) || '',
+        displayName: getContactDisplayName({ localName: contactName, name: participantName }, '') || (previous && previous.displayName) || '',
         isAdmin: participantIsAdmin(participant),
         isSuperAdmin: participantIsSuperAdmin(participant),
         joinedViaApp: previous ? previous.joinedViaApp : true,

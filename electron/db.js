@@ -6,10 +6,21 @@ const {
   phoneDigits,
   phoneFromJid,
   jidFromPhone,
+  formatPhone,
   participantIdentity,
   identityKeys,
-  normalizeAdminId
+  normalizeAdminId,
+  sanitizeContactName,
+  mergeContactRecords
 } = require('./identity');
+
+const NAME_SOURCE_PRIORITY = {
+  local: 5,
+  whatsapp: 4,
+  participant: 3,
+  notify: 2,
+  verified: 1
+};
 
 const DEFAULT_SETTINGS = {
   dailyCap: 20,
@@ -26,7 +37,7 @@ const DEFAULT_SETTINGS = {
 
 function defaultData() {
   return {
-    version: 2,
+    version: 3,
     auth: null,
     settings: { ...DEFAULT_SETTINGS },
     accounts: [],
@@ -170,13 +181,13 @@ class Database {
   }
 
   upsertContact(phoneNumber, name, accountId) {
-    return this.upsertContactIdentity({ phoneNumber }, name, accountId);
+    return this.upsertContactIdentity({ phoneNumber }, name, accountId, 'manual', 'local');
   }
 
-  upsertContactIdentity(identity, name, accountId) {
+  upsertContactIdentity(identity, name, accountId, sourceType = 'group', nameSource = 'participant') {
     const normalized = participantIdentity(identity, identity);
     if (!normalized.id && !normalized.phoneNumber) return null;
-    const cleanName = (name || '').trim();
+    const cleanName = sanitizeContactName(name);
     const now = new Date().toISOString();
     let contact = this.findContact(normalized);
     if (!contact) {
@@ -186,7 +197,10 @@ class Database {
         lid: normalized.lid || '',
         phoneNumber: normalized.phoneNumber || '',
         name: cleanName,
+        localName: nameSource === 'local' ? cleanName : '',
+        nameSource: cleanName ? nameSource : '',
         sourceAccounts: accountId ? [accountId] : [],
+        sourceTypes: sourceType ? [sourceType] : [],
         lastSyncedAt: now
       };
       this.data.contacts.push(contact);
@@ -197,12 +211,26 @@ class Database {
     if (!contact.jid && normalized.jid) contact.jid = normalized.jid;
     if (!contact.lid && normalized.lid) contact.lid = normalized.lid;
     if (!contact.phoneNumber && normalized.phoneNumber) contact.phoneNumber = normalized.phoneNumber;
-    if (cleanName && (!contact.name || /^\+?\d+$/.test(contact.name))) {
+    const currentName = sanitizeContactName(contact.name);
+    const currentPriority = NAME_SOURCE_PRIORITY[contact.nameSource] || (currentName ? 1 : 0);
+    const incomingPriority = NAME_SOURCE_PRIORITY[nameSource] || 0;
+    if (cleanName && nameSource === 'local') {
+      contact.localName = cleanName;
+      if (!currentName || incomingPriority >= currentPriority) {
+        contact.name = cleanName;
+        contact.nameSource = 'local';
+      }
+    } else if (cleanName && (!currentName || incomingPriority > currentPriority)) {
       contact.name = cleanName;
+      contact.nameSource = nameSource;
     }
     if (!Array.isArray(contact.sourceAccounts)) contact.sourceAccounts = [];
     if (accountId && !contact.sourceAccounts.includes(accountId)) {
       contact.sourceAccounts.push(accountId);
+    }
+    if (!Array.isArray(contact.sourceTypes)) contact.sourceTypes = [];
+    if (sourceType && !contact.sourceTypes.includes(sourceType)) {
+      contact.sourceTypes.push(sourceType);
     }
     contact.lastSyncedAt = now;
     return contact;
@@ -210,14 +238,15 @@ class Database {
 
   contactName(value) {
     const contact = this.findContact(value);
-    return contact && contact.name ? contact.name : '';
+    if (!contact) return '';
+    return sanitizeContactName(contact.localName) || sanitizeContactName(contact.name) || '';
   }
 }
 
-function mergeSourceAccounts(target, source) {
-  if (!Array.isArray(target.sourceAccounts)) target.sourceAccounts = [];
-  for (const accountId of source.sourceAccounts || []) {
-    if (accountId && !target.sourceAccounts.includes(accountId)) target.sourceAccounts.push(accountId);
+function mergeSourceTypes(target, source) {
+  if (!Array.isArray(target.sourceTypes)) target.sourceTypes = [];
+  for (const sourceType of source.sourceTypes || []) {
+    if (sourceType && !target.sourceTypes.includes(sourceType)) target.sourceTypes.push(sourceType);
   }
 }
 
@@ -255,7 +284,11 @@ function migrateMember(member) {
   member.jid = identity.jid;
   member.lid = identity.lid;
   member.phoneNumber = identity.phoneNumber;
-  member.displayName = member.displayName || member.name || member.notify || '';
+  member.displayName =
+    sanitizeContactName(member.displayName) ||
+    sanitizeContactName(member.name) ||
+    sanitizeContactName(member.notify) ||
+    '';
   member.isAdmin = Boolean(member.isAdmin);
   member.isSuperAdmin = Boolean(member.isSuperAdmin);
   member.joinedViaApp = member.joinedViaApp !== false;
@@ -317,7 +350,11 @@ function migrateContacts(contacts) {
     contact.jid = identity.jid || '';
     contact.lid = identity.lid || '';
     contact.phoneNumber = identity.phoneNumber || phoneDigits(contact.phoneNumber) || '';
-    contact.name = contact.name || '';
+    contact.localName = sanitizeContactName(contact.localName) || '';
+    contact.name = sanitizeContactName(contact.name) || '';
+    contact.nameSource = contact.nameSource || (contact.name ? 'whatsapp' : '');
+    if (!Array.isArray(contact.sourceTypes)) contact.sourceTypes = [];
+    if (!contact.sourceTypes.length) contact.sourceTypes.push('group');
     if (!contact.id && contact.phoneNumber) contact.id = jidFromPhone(contact.phoneNumber);
     if (!contact.id) continue;
 
@@ -333,11 +370,16 @@ function migrateContacts(contacts) {
       existing = contact;
       migrated.push(existing);
     } else {
-      if (!existing.jid && contact.jid) existing.jid = contact.jid;
-      if (!existing.lid && contact.lid) existing.lid = contact.lid;
-      if (!existing.phoneNumber && contact.phoneNumber) existing.phoneNumber = contact.phoneNumber;
-      if (contact.name && (!existing.name || /^\+?\d+$/.test(existing.name))) existing.name = contact.name;
-      mergeSourceAccounts(existing, contact);
+      const existingName = sanitizeContactName(existing.name);
+      const incomingName = sanitizeContactName(contact.name);
+      const existingPriority = NAME_SOURCE_PRIORITY[existing.nameSource] || (existingName ? 1 : 0);
+      const incomingPriority = NAME_SOURCE_PRIORITY[contact.nameSource] || (incomingName ? 1 : 0);
+      mergeContactRecords(existing, contact);
+      mergeSourceTypes(existing, contact);
+      if (incomingName && (!existingName || incomingPriority > existingPriority)) {
+        existing.name = incomingName;
+        existing.nameSource = contact.nameSource;
+      }
     }
     for (const key of identityKeys(existing)) byKey.set(key, existing);
   }
@@ -347,19 +389,28 @@ function migrateContacts(contacts) {
 function migrateTarget(target) {
   if (!target || typeof target !== 'object') return target;
   const raw = target.jid || target.number || '';
-  if (String(raw).includes('@')) {
-    const jid = normalizeJid(raw);
-    if (jid) target.jid = jid;
-    if (!target.number || String(target.number).includes('@')) {
-      target.number = phoneFromJid(jid) || jid;
-    }
+  const jid = String(raw).includes('@') ? normalizeJid(raw) : '';
+  if (jid) target.jid = jid;
+  const phoneNumber = phoneDigits(target.phoneNumber) || phoneFromJid(jid) || phoneDigits(raw);
+  const displayName = sanitizeContactName(target.displayName) || sanitizeContactName(target.name);
+  if (phoneNumber) {
+    target.phoneNumber = phoneNumber;
+    target.number = phoneNumber;
+    target.displayName = displayName || formatPhone(phoneNumber);
+  } else if (jid) {
+    target.phoneNumber = '';
+    target.number = jid;
+    target.displayName = displayName || 'Unknown contact';
+  } else {
+    target.phoneNumber = '';
+    target.displayName = displayName || '';
   }
   return target;
 }
 
 function migrateData(data) {
   if (!data || typeof data !== 'object') return data;
-  data.version = Math.max(2, Number(data.version) || 1);
+  data.version = Math.max(3, Number(data.version) || 1);
   data.accounts = Array.isArray(data.accounts) ? data.accounts.map(migrateAccount) : [];
   data.groups = Array.isArray(data.groups) ? data.groups.map(migrateGroup) : [];
   data.contacts = migrateContacts(data.contacts);
