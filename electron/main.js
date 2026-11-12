@@ -3,11 +3,15 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const XLSX = require('xlsx');
 const { Database } = require('./db');
-const { SessionManager, friendlyError, normalizePhone } = require('./session-manager');
-const { normalizeJid, isPnJid, isLidJid } = require('./identity');
+const { SessionManager, friendlyError } = require('./session-manager');
+const {
+  formatPhone,
+  getContactDisplayName,
+  hasActiveJobsForGroup
+} = require('./identity');
 const { QueueManager } = require('./queue');
+const { parseSpreadsheet } = require('./spreadsheet');
 
 app.setName('WhatsApp Group Manager');
 
@@ -73,7 +77,7 @@ function groupSummary(group) {
     description: group.description || '',
     memberCount: group.memberCount,
     lastSyncedAt: group.lastSyncedAt,
-    hasOngoingAction: group.hasOngoingAction,
+    hasOngoingAction: hasActiveJobsForGroup(db.data.jobs, group.id),
     hasError: group.hasError,
     adminIds: group.adminIds || [],
     adminAccountIds: group.adminAccountIds || []
@@ -123,22 +127,29 @@ function serializeJobs() {
 
 function serializeContacts() {
   return db.data.contacts
-    .map((contact) => ({
-      id: contact.id || '',
-      jid: contact.jid || '',
-      lid: contact.lid || '',
-      phoneNumber: contact.phoneNumber,
-      name: contact.name || '',
-      sourceAccounts: (contact.sourceAccounts || [])
-        .map((id) => {
-          const account = db.findAccount(id);
-          return account ? account.alias : null;
-        })
-        .filter(Boolean),
-      lastSyncedAt: contact.lastSyncedAt
-    }))
-    .sort((a, b) => String(a.name || a.phoneNumber || a.id || a.jid || a.lid || '')
-      .localeCompare(String(b.name || b.phoneNumber || b.id || b.jid || b.lid || '')));
+    .map((contact) => {
+      const displayName = getContactDisplayName(contact);
+      return {
+        id: contact.id || '',
+        jid: contact.jid || '',
+        phoneNumber: contact.phoneNumber,
+        phoneLabel: formatPhone(contact.phoneNumber),
+        name: contact.name || '',
+        displayName,
+        localName: contact.localName || '',
+        nameSource: contact.nameSource || '',
+        sourceTypes: contact.sourceTypes || [],
+        sourceAccounts: (contact.sourceAccounts || [])
+          .map((id) => {
+            const account = db.findAccount(id);
+            return account ? account.alias : null;
+          })
+          .filter(Boolean),
+        lastSyncedAt: contact.lastSyncedAt
+      };
+    })
+    .sort((a, b) => String(a.displayName || a.phoneLabel || a.id || '')
+      .localeCompare(String(b.displayName || b.phoneLabel || b.id || '')));
 }
 
 function snapshot() {
@@ -204,42 +215,6 @@ function validateSettings(patch) {
     next.quietEnd = patch.quietEnd;
   }
   return next;
-}
-
-function parseSpreadsheet(name, bytes) {
-  if (!bytes) throw new Error('The selected file is empty.');
-  const buffer = Buffer.from(bytes);
-  if (buffer.length > 8 * 1024 * 1024) throw new Error('The file is too large. Use a file under 8 MB.');
-  let workbook;
-  try {
-    workbook = XLSX.read(buffer, { type: 'buffer', raw: true, cellDates: false });
-  } catch (error) {
-    throw new Error('This file could not be read. Use a valid .xlsx or .csv file.');
-  }
-  const sheetName = workbook.SheetNames[0];
-  if (!sheetName) throw new Error('The spreadsheet has no sheets.');
-  const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], {
-    header: 1,
-    blankrows: false,
-    raw: true,
-    defval: ''
-  });
-  if (!rows.length) return [];
-  const first = rows[0].map((cell) => String(cell || '').toLowerCase().trim());
-  const looksLikeHeader =
-    first.some((cell) => /number|phone|telephone|num[eé]ro|mobile/.test(cell)) &&
-    first.some((cell) => /name|nom/.test(cell));
-  const dataRows = looksLikeHeader ? rows.slice(1) : rows;
-  const result = [];
-  for (const row of dataRows.slice(0, 5000)) {
-    const raw = String(row[0] || '').trim();
-    const jid = raw.includes('@') ? normalizeJid(raw) : '';
-    const number = (isPnJid(jid) || isLidJid(jid)) ? jid : normalizePhone(raw);
-    const rawName = String(row[1] || '').trim();
-    if (!number && !rawName) continue;
-    result.push({ number: number || raw, name: rawName });
-  }
-  return result;
 }
 
 function createWindow() {
@@ -403,18 +378,28 @@ function registerIpc() {
     const group = db.findGroup(groupId);
     if (!group) throw new Error('Group not found.');
     const pendingNumbers = [];
+    const pendingTargets = [];
     for (const job of db.data.jobs) {
       if (job.groupId !== groupId || job.type !== mode) continue;
       if (job.status !== 'queued' && job.status !== 'running') continue;
       for (const target of job.targets || []) {
         if (target.status === 'pending' || target.status === 'running') {
-          pendingNumbers.push(target.jid || target.number);
+          const jid = target.jid || target.number;
+          pendingNumbers.push(jid);
+          pendingTargets.push({
+            key: target.jid || target.number,
+            jid: target.jid || '',
+            phoneNumber: target.phoneNumber || '',
+            number: target.number || '',
+            name: target.displayName || target.name || ''
+          });
         }
       }
     }
     return {
       group: fullGroup(group),
       pendingNumbers,
+      pendingTargets,
       mode
     };
   });
@@ -450,8 +435,13 @@ function registerIpc() {
 
   handle('contacts:refresh', async () => {
     requireAuth();
-    await sessions.refreshAllContacts();
-    return { contacts: serializeContacts(), count: db.data.contacts.length };
+    const result = await sessions.refreshAllContacts();
+    return {
+      contacts: serializeContacts(),
+      count: db.data.contacts.length,
+      synced: result.total,
+      failed: result.failed
+    };
   });
 
   handle('accounts:list', async () => {
@@ -499,8 +489,8 @@ function registerIpc() {
   handle('import:parse', async (name, bytes) => {
     requireAuth();
     try {
-      const rows = parseSpreadsheet(name, bytes);
-      return { rows, fileName: String(name || 'spreadsheet') };
+      const parsed = parseSpreadsheet(name, bytes);
+      return { rows: parsed.rows, stats: parsed.stats, fileName: String(name || 'spreadsheet') };
     } catch (error) {
       throw new Error(error.message || 'Could not read the spreadsheet.');
     }

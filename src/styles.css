@@ -797,19 +797,6 @@ button.list-row {
   box-shadow: var(--shadow-sm);
   border: 1px solid rgba(17, 27, 33, 0.05);
   padding: 15px 16px;
-  border-left: 4px solid var(--green);
-}
-
-.job-card.failed {
-  border-left-color: var(--danger);
-}
-
-.job-card.partial {
-  border-left-color: var(--amber);
-}
-
-.job-card.completed {
-  border-left-color: var(--green);
 }
 
 .job-top {
@@ -885,14 +872,36 @@ button.list-row {
 .job-actions {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 8px;
   margin-top: 9px;
 }
 
-.job-actions .btn-ghost {
+.job-errors {
+  min-width: 0;
+}
+
+.job-actions .btn-ghost,
+.job-actions .btn-close {
   font-size: 11.5px;
   min-height: 28px;
   padding: 4px 9px;
+}
+
+.btn-close {
+  margin-left: auto;
+  color: var(--danger);
+  background: rgba(211, 37, 37, 0.08);
+  border: 1px solid rgba(211, 37, 37, 0.22);
+  border-radius: 999px;
+  padding: 4px 11px 4px 8px;
+  gap: 5px;
+}
+
+.btn-close:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--white);
+  border-color: var(--danger);
 }
 
 .empty-state {
@@ -1629,4 +1638,182 @@ button.list-row {
   .page-head h2 {
     font-size: 22px;
   }
+}
+
+.icon-btn.small {
+  width: 30px;
+  height: 30px;
+}
+
+.import-files {
+  display: grid;
+  gap: 8px;
+  margin: -4px 0 16px;
+}
+
+.import-file-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--white);
+  box-shadow: var(--shadow-sm);
+}
+
+.import-file-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--green-light);
+  color: #0b6b3a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+
+.import-file-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.import-file-main strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.import-file-main span {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.import-file-row .icon-btn {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.import-file-row .icon-btn:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.pending-row .source {
+  margin-top: 2px;
+  font-size: 10.5px;
+  color: var(--teal);
+  font-weight: 600;
+}
+
+.member-picker {
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.member-picker-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.member-picker-head h4 {
+  margin: 0 0 3px;
+  font-size: 14px;
+}
+
+.member-picker-head p {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.member-picker-head .count {
+  font-size: 12px;
+  color: var(--teal);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.member-picker-search {
+  margin-top: 12px;
+}
+
+.member-picker-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.member-picker-actions .btn-sm {
+  font-size: 11.5px;
+  min-height: 28px;
+  padding: 4px 9px;
+}
+
+.member-picker-list {
+  max-height: 300px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  margin-bottom: 10px;
+  background: var(--white);
+}
+
+.member-picker-empty {
+  padding: 18px 14px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.member-pick-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.member-pick-row:last-child {
+  border-bottom: 0;
+}
+
+.member-pick-row:hover {
+  background: rgba(18, 140, 126, 0.05);
+}
+
+.member-pick-row.selected {
+  background: rgba(18, 140, 126, 0.09);
+}
+
+.pick-check {
+  margin-left: auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(17, 27, 33, 0.18);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--white);
+  flex: 0 0 auto;
+}
+
+.member-pick-row.selected .pick-check {
+  background: var(--green);
+  border-color: var(--green);
 }

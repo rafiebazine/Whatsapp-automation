@@ -102,6 +102,9 @@ test('creates remove jobs for LID-only members', () => {
   assert.equal(job.targets.length, 1);
   assert.equal(job.targets[0].jid, '222@lid');
   assert.equal(job.targets[0].number, '222@lid');
+  assert.equal(job.targets[0].phoneNumber, '');
+  assert.equal(job.targets[0].displayName, 'LID member');
+  assert.equal(job.targets[0].name, 'LID member');
   assert.equal(job.targets[0].status, 'pending');
 });
 
@@ -125,8 +128,10 @@ test('keeps legacy phone-number job creation working', () => {
     names: { '+212600000003': 'New member' }
   });
   assert.equal(job.targets[0].number, '+212600000003');
+  assert.equal(job.targets[0].phoneNumber, '212600000003');
   assert.equal(job.targets[0].jid, '212600000003@s.whatsapp.net');
   assert.equal(job.targets[0].name, 'New member');
+  assert.equal(job.targets[0].displayName, 'New member');
 });
 
 test('prevents duplicate pending LID targets', () => {
