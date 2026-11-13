@@ -1912,6 +1912,13 @@ function handleGroupsUpdate(groups) {
       else if (state.pageData.group) state.pageData.group = { ...state.pageData.group, ...group };
       if (!state.modalOpen) renderGroupPage();
     }
+  } else if (state.page === 'members' && state.pageData.members && state.pageData.members.context) {
+    const groupId = state.pageData.members.context.group.id;
+    const group = groups.find((item) => item.id === groupId);
+    if (group) {
+      state.pageData.members.context.group = group;
+      if (!state.modalOpen) renderMembersPage();
+    }
   }
 }
 

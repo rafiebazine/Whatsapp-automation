@@ -170,3 +170,125 @@ test('loading the database hydrates cached group and job display names', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('enriches returned members from the central contact index without mutating storage', () => {
+  const { db, dir } = makeDatabase();
+  try {
+    const contact = db.upsertContactIdentity(
+      { id: '777@lid', lid: '777@lid', phoneNumber: '' },
+      'Resolved LID Name',
+      'acc_1',
+      'contact',
+      'whatsapp'
+    );
+    const member = { id: '777@lid', lid: '777@lid', phoneNumber: '', displayName: '' };
+    const enriched = db.enrichMember(member);
+    assert.equal(enriched.displayName, 'Resolved LID Name');
+    assert.equal(enriched.id, contact.id);
+    assert.equal(member.displayName, '');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('contact ingestion updates matching members in every group', async () => {
+  const { db, dir } = makeDatabase();
+  try {
+    const first = group('120363000000000010@g.us');
+    const second = group('120363000000000011@g.us');
+    first.members.push({ id: '778@lid', lid: '778@lid', phoneNumber: '', displayName: '' });
+    second.members.push({ id: '778@lid', lid: '778@lid', phoneNumber: '', displayName: 'Old Name' });
+    db.data.groups.push(first, second);
+
+    const manager = new SessionManager({ db, sessionsRoot: path.join(dir, 'sessions') });
+    let groupsUpdates = 0;
+    manager.on('groups:update', () => { groupsUpdates += 1; });
+
+    await manager.processContactIngest('acc_1', [
+      { id: '778@lid', lid: '778@lid', name: 'Updated LID Name' }
+    ]);
+
+    assert.equal(first.members[0].displayName, 'Updated LID Name');
+    assert.equal(second.members[0].displayName, 'Updated LID Name');
+    assert.ok(groupsUpdates > 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('empty contact names preserve cached member names', async () => {
+  const { db, dir } = makeDatabase();
+  try {
+    const target = group('120363000000000012@g.us');
+    target.members.push({ id: '779@lid', lid: '779@lid', phoneNumber: '', displayName: 'Cached Member Name' });
+    db.data.groups.push(target);
+
+    const manager = new SessionManager({ db, sessionsRoot: path.join(dir, 'sessions') });
+    await manager.processContactIngest('acc_1', [
+      { id: '779@lid', lid: '779@lid', name: '' }
+    ]);
+
+    assert.equal(target.members[0].displayName, 'Cached Member Name');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolves PN and LID members separately without name-based merging', () => {
+  const { db, dir } = makeDatabase();
+  try {
+    db.upsertContactIdentity(
+      { id: '212600000010@s.whatsapp.net', jid: '212600000010@s.whatsapp.net', phoneNumber: '212600000010' },
+      'PN Name',
+      'acc_1',
+      'contact',
+      'whatsapp'
+    );
+    db.upsertContactIdentity(
+      { id: '780@lid', lid: '780@lid', phoneNumber: '' },
+      'LID Name',
+      'acc_1',
+      'contact',
+      'whatsapp'
+    );
+    const pnMember = { id: '212600000010@s.whatsapp.net', jid: '212600000010@s.whatsapp.net', phoneNumber: '212600000010' };
+    const lidMember = { id: '780@lid', lid: '780@lid', phoneNumber: '' };
+    assert.equal(db.enrichMember(pnMember).displayName, 'PN Name');
+    assert.equal(db.enrichMember(lidMember).displayName, 'LID Name');
+    assert.equal(db.data.contacts.length, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('full contact sync propagates names without a group re-add', async () => {
+  const { db, dir } = makeDatabase();
+  try {
+    const target = group('120363000000000013@g.us');
+    target.members.push({ id: '781@lid', lid: '781@lid', phoneNumber: '', displayName: '' });
+    db.data.groups.push(target);
+
+    const manager = new SessionManager({ db, sessionsRoot: path.join(dir, 'sessions') });
+    manager.sockets.set('acc_1', {
+      connected: true,
+      sock: {
+        groupFetchAllParticipating: async () => ({
+          [target.id]: {
+            id: target.id,
+            subject: target.name,
+            participants: [{ id: '781@lid', lid: '781@lid', name: 'Synced LID Name' }]
+          }
+        })
+      }
+    });
+    let groupsUpdates = 0;
+    manager.on('groups:update', () => { groupsUpdates += 1; });
+
+    await manager.syncContacts('acc_1');
+
+    assert.equal(target.members[0].displayName, 'Synced LID Name');
+    assert.ok(groupsUpdates > 0);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

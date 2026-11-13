@@ -333,11 +333,30 @@ class Database {
     return contact;
   }
 
-  refreshCachedDisplayNames() {
+  enrichMember(member) {
+    if (!member || typeof member !== 'object') return member;
+    const resolved = this.contactName(member);
+    const fallback = sanitizeContactName(member.displayName) || sanitizeContactName(member.name);
+    return { ...member, displayName: resolved || fallback || '' };
+  }
+
+  refreshCachedDisplayNames(changedContacts) {
     this.ensureContactIndex();
+    const changedKeys = Array.isArray(changedContacts)
+      ? new Set(changedContacts.flatMap((contact) => Array.from(identityKeys(contact))))
+      : null;
+    const matchesChangedContact = (value) => {
+      if (!changedKeys) return true;
+      if (changedKeys.size === 0) return false;
+      for (const key of identityKeys(value)) {
+        if (changedKeys.has(key)) return true;
+      }
+      return false;
+    };
     let changed = 0;
     for (const group of this.data.groups || []) {
       for (const member of group.members || []) {
+        if (!matchesChangedContact(member)) continue;
         const name = this.contactName(member);
         if (name && member.displayName !== name) {
           member.displayName = name;
@@ -347,7 +366,9 @@ class Database {
     }
     for (const job of this.data.jobs || []) {
       for (const target of job.targets || []) {
-        const name = this.contactName(target.jid || target.number || target.phoneNumber);
+        const value = target.jid || target.number || target.phoneNumber;
+        if (!matchesChangedContact(value)) continue;
+        const name = this.contactName(value);
         if (name && target.displayName !== name) {
           target.displayName = name;
           changed += 1;

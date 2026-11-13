@@ -131,11 +131,13 @@ function groupSummary(group) {
 function fullGroup(group) {
   return {
     ...groupSummary(group),
-    members: (group.members || []).slice().sort((a, b) => {
-      const aName = (a.displayName || a.phoneNumber || a.id || '').toLowerCase();
-      const bName = (b.displayName || b.phoneNumber || b.id || '').toLowerCase();
-      return aName.localeCompare(bName);
-    })
+    members: (group.members || [])
+      .map((member) => db.enrichMember(member))
+      .sort((a, b) => {
+        const aName = (a.displayName || a.phoneNumber || a.id || '').toLowerCase();
+        const bName = (b.displayName || b.phoneNumber || b.id || '').toLowerCase();
+        return aName.localeCompare(bName);
+      })
   };
 }
 

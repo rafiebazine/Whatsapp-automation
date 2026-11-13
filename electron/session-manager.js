@@ -748,10 +748,12 @@ class SessionManager extends EventEmitter {
     stats.uniqueParticipants = pending.length;
     const batchSize = Math.max(1, Number(this.contactSyncBatchSize) || CONTACT_SYNC_BATCH_SIZE);
     stats.batches = Math.ceil(pending.length / batchSize);
+    const touchedContacts = [];
     for (let index = 0; index < pending.length; index += 1) {
       const item = pending[index];
       const existingCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
-      this.db.upsertContactIdentity(item.identity, item.name, accountId, 'contact', item.nameSource);
+      const contact = this.db.upsertContactIdentity(item.identity, item.name, accountId, 'contact', item.nameSource);
+      if (contact) touchedContacts.push(contact);
       const nextCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
       if (nextCount > existingCount) {
         stats.created += 1;
@@ -765,8 +767,10 @@ class SessionManager extends EventEmitter {
     }
 
     if (pending.length > 0) {
+      const namesChanged = this.db.refreshCachedDisplayNames(touchedContacts);
       this.db.save();
       this.emit('contacts:update');
+      if (namesChanged > 0) this.emit('groups:update');
     }
 
     stats.durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
@@ -836,10 +840,12 @@ class SessionManager extends EventEmitter {
       stats.uniqueParticipants = pending.length;
       const batchSize = Math.max(1, Number(this.contactSyncBatchSize) || CONTACT_SYNC_BATCH_SIZE);
       stats.batches = Math.ceil(pending.length / batchSize);
+      const touchedContacts = [];
       for (let index = 0; index < pending.length; index += 1) {
         const item = pending[index];
         const existingCount = this.db.data.contacts.length;
-        this.db.upsertContactIdentity(item.identity, item.name, accountId, 'group', item.nameSource);
+        const contact = this.db.upsertContactIdentity(item.identity, item.name, accountId, 'group', item.nameSource);
+        if (contact) touchedContacts.push(contact);
         if (this.db.data.contacts.length > existingCount) {
           stats.created += 1;
         } else {
@@ -851,8 +857,10 @@ class SessionManager extends EventEmitter {
         }
       }
 
+      const namesChanged = this.db.refreshCachedDisplayNames(touchedContacts);
       this.db.save();
       this.emit('contacts:update');
+      if (namesChanged > 0) this.emit('groups:update');
     } catch (error) {
       console.error('Contact sync failed:', error);
       throw error;
