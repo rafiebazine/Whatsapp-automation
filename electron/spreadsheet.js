@@ -1,6 +1,6 @@
 const XLSX = require('xlsx');
 const {
-  normalizePhone,
+  parsePhoneNumber,
   normalizeJid,
   isPnJid,
   isLidJid,
@@ -50,8 +50,12 @@ function parseSpreadsheet(name, bytes) {
   const seen = new Set();
   let invalid = 0;
   let duplicate = 0;
+  let ambiguous = 0;
+  let assumedLocalZero = 0;
+  const warnings = [];
   for (const row of limitedRows) {
-    const raw = String(row[0] || '').trim();
+    const rawCell = row[0];
+    const raw = String(rawCell || '').trim();
     const rawName = String(row[1] || '').trim();
     if (!raw && !rawName) continue;
 
@@ -67,14 +71,23 @@ function parseSpreadsheet(name, bytes) {
       phoneNumber = phoneDigits(jid.split('@')[0]) || '';
       number = phoneNumber ? `+${phoneNumber}` : jid;
     } else {
-      const phone = normalizePhone(raw);
-      if (!phone) {
+      const numericCell = typeof rawCell === 'number';
+      const parsed = parsePhoneNumber(raw, numericCell ? { assumeAlgerianLocal: true } : {});
+      if (!parsed.valid) {
+        if (parsed.ambiguous) {
+          ambiguous += 1;
+          warnings.push(`Ambiguous number "${raw}" needs a country code or leading 0.`);
+        }
         invalid += 1;
         continue;
       }
-      phoneNumber = phone.replace(/\D/g, '');
+      if (parsed.assumedLocalZero) {
+        assumedLocalZero += 1;
+        warnings.push(`Assumed Algerian local format for "${raw}" because the spreadsheet removed its leading zero.`);
+      }
+      phoneNumber = parsed.digits;
+      number = parsed.canonical;
       jid = `${phoneNumber}@s.whatsapp.net`;
-      number = phone;
     }
 
     const key = jid;
@@ -97,6 +110,9 @@ function parseSpreadsheet(name, bytes) {
       valid: result.length,
       invalid,
       duplicate,
+      ambiguous,
+      assumedLocalZero,
+      warnings,
       truncated: Math.max(0, dataRows.length - limitedRows.length)
     }
   };

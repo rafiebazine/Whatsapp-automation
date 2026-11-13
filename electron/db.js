@@ -100,6 +100,7 @@ class Database {
       this.save();
     }
     this.rebuildContactIndex();
+    if (this.refreshCachedDisplayNames() > 0) this.save();
     return this.data;
   }
 
@@ -165,7 +166,8 @@ class Database {
       pausedForDay: null,
       batchCount: 0,
       batchPauseUntil: 0,
-      lastActionAt: 0
+      lastActionAt: 0,
+      adminAccess: {}
     };
     this.data.accounts.push(account);
     this.save();
@@ -331,6 +333,30 @@ class Database {
     return contact;
   }
 
+  refreshCachedDisplayNames() {
+    this.ensureContactIndex();
+    let changed = 0;
+    for (const group of this.data.groups || []) {
+      for (const member of group.members || []) {
+        const name = this.contactName(member);
+        if (name && member.displayName !== name) {
+          member.displayName = name;
+          changed += 1;
+        }
+      }
+    }
+    for (const job of this.data.jobs || []) {
+      for (const target of job.targets || []) {
+        const name = this.contactName(target.jid || target.number || target.phoneNumber);
+        if (name && target.displayName !== name) {
+          target.displayName = name;
+          changed += 1;
+        }
+      }
+    }
+    return changed;
+  }
+
   contactName(value) {
     const contact = this.findContact(value);
     if (!contact) return '';
@@ -351,6 +377,7 @@ function migrateAccount(account) {
   account.whatsappJid = normalizeJid(account.whatsappJid) || '';
   account.whatsappLid = normalizeJid(account.whatsappLid) || '';
   account.phoneNumber = phoneDigits(account.phoneNumber) || '';
+  account.adminAccess = account.adminAccess && typeof account.adminAccess === 'object' ? account.adminAccess : {};
 
   if (account.whatsappId) {
     if (!account.whatsappJid && account.whatsappId.endsWith('@s.whatsapp.net')) {
@@ -495,11 +522,12 @@ function migrateTarget(target) {
   } else if (jid) {
     target.phoneNumber = '';
     target.number = jid;
-    target.displayName = displayName || 'Unknown contact';
+    target.displayName = displayName || '';
   } else {
     target.phoneNumber = '';
     target.displayName = displayName || '';
   }
+  target.name = sanitizeContactName(target.name) || displayName || '';
   return target;
 }
 

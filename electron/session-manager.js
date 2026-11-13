@@ -14,6 +14,7 @@ const {
   phoneFromJid,
   jidFromPhone,
   normalizePhone,
+  parsePhoneNumber,
   formatPhone,
   participantIdentity,
   identityKeys,
@@ -80,6 +81,12 @@ function statusCodeOf(error) {
   } catch (err) {
     return undefined;
   }
+}
+
+function actionError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 class SessionManager extends EventEmitter {
@@ -163,6 +170,120 @@ class SessionManager extends EventEmitter {
 
   isAdminOf(account, group) {
     return accountIsAdminOfGroup(account, group);
+  }
+
+  isVerifiedAdminOf(account, group) {
+    if (!account || !group || !group.id) return false;
+    const access = account.adminAccess && account.adminAccess[group.id];
+    return Boolean(access && access.status === 'verified');
+  }
+
+  setAdminAccess(account, groupId, status, error) {
+    if (!account || !groupId) return;
+    if (!account.adminAccess || typeof account.adminAccess !== 'object') account.adminAccess = {};
+    account.adminAccess[groupId] = {
+      status,
+      checkedAt: new Date().toISOString(),
+      error: error ? friendlyError(error) : ''
+    };
+  }
+
+  recordAdminAccess(account, group, metadata) {
+    if (!account || !group || !group.id) return 'unknown';
+    const participants = (metadata && metadata.participants) || [];
+    const participant = participants.find((item) => identityMatches(item, account));
+    const status = participant
+      ? (participantIsAdmin(participant) ? 'verified' : 'not_admin')
+      : 'not_member';
+    this.setAdminAccess(account, group.id, status, '');
+    return status;
+  }
+
+  invalidateAdminAccess(account, reason) {
+    if (!account) return;
+    if (!account.adminAccess || typeof account.adminAccess !== 'object') account.adminAccess = {};
+    const now = new Date().toISOString();
+    for (const group of this.db.data.groups) {
+      account.adminAccess[group.id] = {
+        status: 'unknown',
+        checkedAt: now,
+        error: reason || 'Waiting for fresh admin verification.'
+      };
+    }
+  }
+
+  async verifyAdminAccess(accountId, groupId) {
+    const account = this.db.findAccount(accountId);
+    const entry = this.sockets.get(accountId);
+    const group = this.db.findGroup(groupId);
+    if (!account) return { status: 'unknown', error: 'Account not found.' };
+    if (!group) return { status: 'unknown', error: 'Group not found.' };
+    if (!entry || !entry.connected) {
+      this.setAdminAccess(account, groupId, 'unknown', 'Account is disconnected.');
+      this.db.save();
+      this.emit('accounts:update');
+      return { status: 'unknown', error: 'Account is disconnected.' };
+    }
+
+    let metadata;
+    try {
+      metadata = await entry.sock.groupMetadata(groupId);
+    } catch (error) {
+      const message = friendlyError(error);
+      this.setAdminAccess(account, groupId, 'unknown', message);
+      group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== account.id);
+      this.db.save();
+      this.emit('accounts:update');
+      this.emit('groups:update');
+      return { status: 'unknown', error: message };
+    }
+
+    this.applyMetadataToGroup(group, metadata, account, true);
+    const status = this.recordAdminAccess(account, group, metadata);
+    this.db.save();
+    this.emit('accounts:update');
+    this.emit('groups:update');
+    return {
+      status,
+      error: status === 'verified' ? '' : 'This account is not a verified admin of this group.',
+      group,
+      metadata
+    };
+  }
+
+  async refreshAdminAccess(accountId) {
+    const account = this.db.findAccount(accountId);
+    const entry = this.sockets.get(accountId);
+    if (!account || !entry || !entry.connected) return;
+
+    let groups;
+    try {
+      groups = await entry.sock.groupFetchAllParticipating();
+      if (!groups || typeof groups !== 'object') throw new Error('WhatsApp returned no group data.');
+    } catch (error) {
+      const message = friendlyError(error);
+      for (const group of this.db.data.groups) {
+        this.setAdminAccess(account, group.id, 'unknown', message);
+      }
+      this.db.save();
+      this.emit('accounts:update');
+      return;
+    }
+
+    for (const group of this.db.data.groups) {
+      const metadata = groups[group.id];
+      if (metadata) {
+        this.applyMetadataToGroup(group, metadata, account, true);
+        this.recordAdminAccess(account, group, metadata);
+      } else {
+        this.setAdminAccess(account, group.id, 'not_member', '');
+        group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== account.id);
+        group.hasError = (group.adminIds || []).length === 0;
+      }
+    }
+    this.db.save();
+    this.emit('accounts:update');
+    this.emit('groups:update');
   }
 
   async startAccount(accountId) {
@@ -275,10 +396,12 @@ class SessionManager extends EventEmitter {
           account.lastError = null;
           this.reconnectAttempts.set(account.id, 0);
           this.db.save();
+          this.invalidateAdminAccess(account, 'Waiting for fresh admin verification.');
+          this.db.save();
           this.emit('accounts:update');
           this.emit('connection:open', { accountId: account.id });
           this.syncContacts(account.id).catch(() => {});
-          this.refreshManagedGroups(account.id).catch(() => {});
+          this.refreshAdminAccess(account.id).catch(() => {});
           if (account.pendingOnboarding) {
             this.onboardAccount(account.id).catch(() => {});
           }
@@ -286,6 +409,7 @@ class SessionManager extends EventEmitter {
 
         if (connection === 'close') {
           entry.connected = false;
+          this.invalidateAdminAccess(account, 'Account disconnected.');
           const statusCode = statusCodeOf(lastDisconnect && lastDisconnect.error);
           if (statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403) {
             account.status = 'banned';
@@ -508,6 +632,7 @@ class SessionManager extends EventEmitter {
     account.needsRelink = false;
     account.pendingOnboarding = true;
     account.onboardingError = null;
+    account.adminAccess = {};
     account.qr = null;
     account.connectedAt = null;
     account.lastError = null;
@@ -957,7 +1082,9 @@ class SessionManager extends EventEmitter {
       try {
         const metadata = await entry.sock.groupMetadata(groupId);
         this.applyMetadataToGroup(group, metadata, account, true);
+        this.recordAdminAccess(account, group, metadata);
         this.db.save();
+        this.emit('accounts:update');
         this.emit('groups:update');
         return group;
       } catch (error) {
@@ -1004,10 +1131,28 @@ class SessionManager extends EventEmitter {
         const jid = normalizeJid(text);
         return isPnJid(jid) || isLidJid(jid) ? jid : null;
       }
-      return jidFromPhone(text) || null;
+      const parsed = parsePhoneNumber(text);
+      return parsed.valid ? jidFromPhone(parsed.canonical) : null;
     });
     if (jids.some((jid) => !jid)) {
       throw new Error('Invalid WhatsApp recipient identity. Use a phone number or a WhatsApp JID.');
+    }
+
+    const access = await this.verifyAdminAccess(accountId, groupJid);
+    if (access.status !== 'verified') {
+      throw actionError('admin_unverified', 'This account is not a verified admin of this group.');
+    }
+
+    if (action === 'remove') {
+      const protectedAccount = this.db.data.accounts.find((linked) =>
+        jids.some((jid) => identityMatches(jid, linked))
+      );
+      if (protectedAccount) {
+        throw actionError(
+          'protected_admin_target',
+          `${protectedAccount.alias} is a linked admin account and cannot be removed from a group.`
+        );
+      }
     }
 
     const results = await entry.sock.groupParticipantsUpdate(groupJid, jids, action);
@@ -1033,7 +1178,7 @@ class SessionManager extends EventEmitter {
     const candidates = this.db.data.accounts.filter((account) => {
       if (account.id === excludeAccountId) return false;
       const entry = this.sockets.get(account.id);
-      return entry && entry.connected && this.isAdminOf(account, group);
+      return Boolean(entry && entry.connected);
     });
     for (const account of candidates) {
       const entry = this.sockets.get(account.id);
@@ -1062,7 +1207,8 @@ class SessionManager extends EventEmitter {
       const groups = [...this.db.data.groups];
       for (const group of groups) {
         try {
-          if (this.isAdminOf(account, group)) {
+          const access = await this.verifyAdminAccess(accountId, group.id);
+          if (access.status === 'verified') {
             if (!Array.isArray(group.adminAccountIds)) group.adminAccountIds = [];
             if (!group.adminAccountIds.includes(accountId)) group.adminAccountIds.push(accountId);
             continue;
@@ -1139,7 +1285,8 @@ class SessionManager extends EventEmitter {
     for (const account of this.db.data.accounts) {
       const entry = this.sockets.get(account.id);
       if (!entry || !entry.connected) continue;
-      if (!this.isAdminOf(account, group)) continue;
+      const access = await this.verifyAdminAccess(account.id, groupId);
+      if (access.status !== 'verified') continue;
       try {
         return await entry.sock.groupInviteCode(groupId);
       } catch (error) {

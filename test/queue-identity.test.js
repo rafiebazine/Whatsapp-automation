@@ -77,6 +77,7 @@ function makeQueue(db) {
   const sessions = {
     isConnected: () => true,
     isAdminOf: (account, group) => accountIsAdminOfGroup(account, group),
+    isVerifiedAdminOf: (account, group) => accountIsAdminOfGroup(account, group),
     sendAction: async () => [],
     refreshGroup: async () => {}
   };
@@ -134,6 +135,19 @@ test('keeps legacy phone-number job creation working', () => {
   assert.equal(job.targets[0].displayName, 'New member');
 });
 
+test('normalizes Algerian local numbers to canonical phone JIDs', () => {
+  const db = makeDb();
+  const queue = makeQueue(db);
+  const job = queue.createJob({
+    type: 'add',
+    groupId: db.data.groups[0].id,
+    targets: [{ number: '0551234567', name: 'Algerian member' }]
+  });
+  assert.equal(job.targets[0].number, '+213551234567');
+  assert.equal(job.targets[0].phoneNumber, '213551234567');
+  assert.equal(job.targets[0].jid, '213551234567@s.whatsapp.net');
+});
+
 test('prevents duplicate pending LID targets', () => {
   const db = makeDb();
   const queue = makeQueue(db);
@@ -147,6 +161,49 @@ test('prevents duplicate pending LID targets', () => {
     groupId: db.data.groups[0].id,
     targets: [{ jid: '222@lid' }]
   }), /None of these recipients/);
+});
+
+test('admin verification blocks do not consume the daily action or batch count', async () => {
+  const db = makeDb();
+  const queue = makeQueue(db);
+  queue.sessions.sendAction = async () => {
+    const error = new Error('not a verified admin');
+    error.code = 'admin_unverified';
+    throw error;
+  };
+  const job = queue.createJob({
+    type: 'remove',
+    groupId: db.data.groups[0].id,
+    targets: [{ jid: '222@lid' }]
+  });
+  const account = db.data.accounts[0];
+  await queue.execute(job, job.targets[0], account, db.data.groups[0]);
+  assert.equal(job.targets[0].status, 'pending');
+  assert.equal(account.dailyActionCount, 0);
+  assert.equal(account.batchCount || 0, 0);
+  assert.equal(job.status, 'running');
+});
+
+test('protected linked-account targets are skipped without consuming the daily action', async () => {
+  const db = makeDb();
+  const queue = makeQueue(db);
+  queue.sessions.sendAction = async () => {
+    const error = new Error('linked account');
+    error.code = 'protected_admin_target';
+    throw error;
+  };
+  const job = queue.createJob({
+    type: 'remove',
+    groupId: db.data.groups[0].id,
+    targets: [{ jid: '222@lid' }]
+  });
+  const account = db.data.accounts[0];
+  await queue.execute(job, job.targets[0], account, db.data.groups[0]);
+  assert.equal(job.targets[0].status, 'skipped');
+  assert.equal(job.targets[0].protected, true);
+  assert.match(job.blockedReason, /linked account/);
+  assert.equal(account.dailyActionCount, 0);
+  assert.equal(job.blockedCount, 1);
 });
 
 test('executes LID targets and normalizes string statuses', async () => {

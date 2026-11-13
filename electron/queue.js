@@ -1,12 +1,13 @@
 const crypto = require('crypto');
 const { EventEmitter } = require('events');
-const { friendlyError, normalizePhone } = require('./session-manager');
+const { friendlyError } = require('./session-manager');
 const {
   normalizeJid,
   isPnJid,
   isLidJid,
   phoneFromJid,
   jidFromPhone,
+  parsePhoneNumber,
   identityKeys,
   formatPhone,
   sanitizeContactName
@@ -50,10 +51,11 @@ function normalizeTarget(raw) {
       key: jid
     };
   }
-  const phone = normalizePhone(text);
-  if (!phone) return null;
+  const parsed = parsePhoneNumber(text);
+  if (!parsed.valid) return null;
+  const phone = parsed.canonical;
   const jid = jidFromPhone(phone);
-  const phoneNumber = phone.replace(/\D/g, '');
+  const phoneNumber = parsed.digits;
   return {
     jid,
     phoneNumber,
@@ -185,7 +187,7 @@ class QueueManager extends EventEmitter {
         if (account.pausedForDay === today) return false;
         if (account.dailyActionCount >= settings.dailyCap) return false;
         if ((account.batchPauseUntil || 0) > now) return false;
-        if (!this.sessions.isAdminOf(account, group)) return false;
+        if (!this.sessions.isVerifiedAdminOf(account, group)) return false;
         return true;
       })
       .sort((a, b) => {
@@ -200,11 +202,11 @@ class QueueManager extends EventEmitter {
     const connectedAdmins = this.db.data.accounts.filter((account) => {
       if (account.status !== 'connected' || account.needsRelink) return false;
       if (!this.sessions.isConnected(account.id)) return false;
-      return this.sessions.isAdminOf(account, group);
+      return this.sessions.isVerifiedAdminOf(account, group);
     });
     if (connectedAdmins.length === 0) {
       const anyAdminAccount = this.db.data.accounts.some(
-        (account) => (group.adminAccountIds || []).includes(account.id) || this.sessions.isAdminOf(account, group)
+        (account) => (group.adminAccountIds || []).includes(account.id) || this.sessions.isVerifiedAdminOf(account, group)
       );
       return anyAdminAccount
         ? 'No admin account for this group is currently connected.'
@@ -349,6 +351,14 @@ class QueueManager extends EventEmitter {
     );
   }
 
+  isAdminBlockError(error) {
+    return Boolean(error && error.code === 'admin_unverified');
+  }
+
+  isProtectedTargetError(error) {
+    return Boolean(error && error.code === 'protected_admin_target');
+  }
+
   async execute(job, target, account, group) {
     const settings = this.getSettings();
     const today = this.db.todayKey();
@@ -357,6 +367,7 @@ class QueueManager extends EventEmitter {
     job.status = 'running';
     if (!job.startedAt) job.startedAt = new Date().toISOString();
     job.blockedReason = null;
+    let localBlock = false;
     this.db.save();
     this.emitJobs();
 
@@ -393,29 +404,59 @@ class QueueManager extends EventEmitter {
       });
     } catch (error) {
       const message = friendlyError(error);
-      account.dailyActionCount += 1;
-      account.dailyActionLimit = settings.dailyCap;
-      account.lastActionAt = Date.now();
-      account.lastActiveAt = new Date().toISOString();
-      account.consecutiveFailures = (account.consecutiveFailures || 0) + 1;
-      const canRetry = this.isRetryableError(error) && target.attempts < 3;
-      if (canRetry) {
+      if (this.isAdminBlockError(error)) {
+        localBlock = true;
         target.status = 'pending';
         target.error = message;
         target.accountId = account.id;
-      } else {
-        target.status = 'failed';
+        job.blockedReason = message;
+        this.db.addLog({
+          jobId: job.id,
+          numberOrAction: target.displayName || target.name || target.number,
+          accountUsed: account.alias,
+          result: 'blocked',
+          errorMessage: message
+        });
+      } else if (this.isProtectedTargetError(error)) {
+        localBlock = true;
+        target.status = 'skipped';
         target.error = message;
+        target.protected = true;
         target.accountId = account.id;
         target.processedAt = new Date().toISOString();
+        job.blockedReason = message;
+        this.db.addLog({
+          jobId: job.id,
+          numberOrAction: target.displayName || target.name || target.number,
+          accountUsed: account.alias,
+          result: 'blocked',
+          errorMessage: message
+        });
+      } else {
+        account.dailyActionCount += 1;
+        account.dailyActionLimit = settings.dailyCap;
+        account.lastActionAt = Date.now();
+        account.lastActiveAt = new Date().toISOString();
+        account.consecutiveFailures = (account.consecutiveFailures || 0) + 1;
+        const canRetry = this.isRetryableError(error) && target.attempts < 3;
+        if (canRetry) {
+          target.status = 'pending';
+          target.error = message;
+          target.accountId = account.id;
+        } else {
+          target.status = 'failed';
+          target.error = message;
+          target.accountId = account.id;
+          target.processedAt = new Date().toISOString();
+        }
+        this.db.addLog({
+          jobId: job.id,
+          numberOrAction: target.displayName || target.name || target.number,
+          accountUsed: account.alias,
+          result: 'failure',
+          errorMessage: message
+        });
       }
-      this.db.addLog({
-        jobId: job.id,
-        numberOrAction: target.displayName || target.name || target.number,
-        accountUsed: account.alias,
-        result: 'failure',
-        errorMessage: message
-      });
     }
 
     if (account.consecutiveFailures >= settings.failurePauseThreshold && account.pausedForDay !== today) {
@@ -428,11 +469,14 @@ class QueueManager extends EventEmitter {
       });
     }
 
-    account.batchCount = (account.batchCount || 0) + 1;
-    if (account.batchCount >= settings.batchSize) {
-      account.batchCount = 0;
-      account.batchPauseUntil =
-        Date.now() + randomBetween(settings.batchPauseMinSeconds, settings.batchPauseMaxSeconds) * 1000;
+    const consumedAction = !localBlock;
+    if (consumedAction) {
+      account.batchCount = (account.batchCount || 0) + 1;
+      if (account.batchCount >= settings.batchSize) {
+        account.batchCount = 0;
+        account.batchPauseUntil =
+          Date.now() + randomBetween(settings.batchPauseMinSeconds, settings.batchPauseMaxSeconds) * 1000;
+      }
     }
 
     this.updateJobState(job, group);
@@ -451,17 +495,19 @@ class QueueManager extends EventEmitter {
       total: targets.length
     };
     job.errors = targets
-      .filter((target) => target.status === 'failed')
+      .filter((target) => target.status === 'failed' || target.protected)
       .map((target) => ({
         number: target.displayName || target.name || target.number,
         name: target.displayName || target.name || '',
         phoneNumber: target.phoneNumber || '',
         error: target.error || 'Unknown error',
-        accountId: target.accountId || null
+        accountId: target.accountId || null,
+        protected: Boolean(target.protected)
       }));
     job.successCount = targets.filter((target) => target.status === 'success').length;
     job.failedCount = targets.filter((target) => target.status === 'failed').length;
     job.skippedCount = targets.filter((target) => target.status === 'skipped').length;
+    job.blockedCount = targets.filter((target) => target.protected).length;
     const pending = targets.filter((target) => target.status === 'pending' || target.status === 'running').length;
     if (pending === 0) {
       const failed = job.failedCount;
@@ -567,8 +613,9 @@ class QueueManager extends EventEmitter {
     }
 
     const targets = filtered.map((target) => {
-      const name = target.name || nameMap.get(target.key) || this.db.contactName(target.jid || target.number) || '';
-      const displayName = name || target.displayName || 'Unknown contact';
+      const providedName = target.name || nameMap.get(target.key) || '';
+      const name = this.db.contactName(target.jid || target.number || target.phoneNumber) || providedName || '';
+      const displayName = name || target.displayName || target.number || target.jid || '';
       return {
         number: target.number,
         phoneNumber: target.phoneNumber || '',
@@ -619,7 +666,7 @@ class QueueManager extends EventEmitter {
     const settings = this.getSettings();
     const avgDelay = (settings.minDelaySeconds + settings.maxDelaySeconds) / 2;
     const connectedAdmins = this.db.data.accounts.filter(
-      (account) => account.status === 'connected' && this.sessions.isAdminOf(account, group)
+      (account) => account.status === 'connected' && this.sessions.isVerifiedAdminOf(account, group)
     ).length;
     const accounts = Math.max(1, connectedAdmins);
     const batches = Math.ceil(count / (settings.batchSize * accounts));

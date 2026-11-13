@@ -81,7 +81,7 @@ test('migrates legacy phone data without losing LID members', () => {
   assert.equal(data.jobs[0].targets[1].status, 'running');
   assert.equal(data.jobs[0].targets[1].jid, '222@lid');
   assert.equal(data.jobs[0].targets[1].phoneNumber, '');
-  assert.equal(data.jobs[0].targets[1].displayName, 'Unknown contact');
+  assert.equal(data.jobs[0].targets[1].displayName, '');
 });
 
 test('migration is idempotent', () => {

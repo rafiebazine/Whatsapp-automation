@@ -45,30 +45,117 @@
     return Boolean(parsed && parsed.server === LID_DOMAIN);
   }
 
-  function phoneDigits(value) {
+  function parsePhoneNumber(value, options = {}) {
     const text = asText(value);
-    if (!text || text.includes('@')) return '';
-    if (!/^[+\d\s\-().]+$/.test(text)) return '';
-    const digits = text.replace(/\D/g, '');
-    if (digits.length < 8 || digits.length > 15) return '';
-    return digits;
+    const result = {
+      valid: false,
+      canonical: '',
+      digits: '',
+      national: '',
+      country: '',
+      reason: '',
+      ambiguous: false,
+      assumedLocalZero: false
+    };
+    if (!text) {
+      result.reason = 'empty';
+      return result;
+    }
+    if (text.includes('@')) {
+      result.reason = 'identity';
+      return result;
+    }
+    const normalizedDigits = text.replace(/[٠-٩]/g, (digit) => String(digit.charCodeAt(0) - 0x0660));
+    if (!/^[+\d\s\-().]+$/.test(normalizedDigits)) {
+      result.reason = 'invalid_characters';
+      return result;
+    }
+    let cleaned = normalizedDigits.replace(/[\s\-().]/g, '');
+    if (cleaned.startsWith('00')) cleaned = `+${cleaned.slice(2)}`;
+    if (!/^\+?\d+$/.test(cleaned)) {
+      result.reason = 'invalid_characters';
+      return result;
+    }
+    if (cleaned.slice(1).includes('+')) {
+      result.reason = 'invalid_characters';
+      return result;
+    }
+
+    const explicitInternational = cleaned.startsWith('+');
+    const digits = cleaned.replace(/\D/g, '');
+    const algerianLocal = /^0([5-7]\d{8})$/.exec(digits);
+    const algerianInternational = /^213([5-7]\d{8})$/.exec(digits);
+    const bareDzMobile = /^([5-7]\d{8})$/.exec(digits);
+
+    if (algerianLocal) {
+      result.valid = true;
+      result.country = 'DZ';
+      result.digits = `213${algerianLocal[1]}`;
+      result.canonical = `+${result.digits}`;
+      result.national = digits;
+      return result;
+    }
+    if (algerianInternational && (explicitInternational || digits.length === 12)) {
+      result.valid = true;
+      result.country = 'DZ';
+      result.digits = digits;
+      result.canonical = `+${digits}`;
+      result.national = `0${algerianInternational[1]}`;
+      return result;
+    }
+    if (!explicitInternational && digits.startsWith('0')) {
+      result.reason = 'invalid_algerian';
+      return result;
+    }
+    if ((explicitInternational || digits.startsWith('213')) && digits.startsWith('213')) {
+      result.reason = 'invalid_algerian';
+      return result;
+    }
+    if (!explicitInternational && bareDzMobile) {
+      if (options.assumeAlgerianLocal) {
+        result.valid = true;
+        result.country = 'DZ';
+        result.digits = `213${bareDzMobile[1]}`;
+        result.canonical = `+${result.digits}`;
+        result.national = `0${bareDzMobile[1]}`;
+        result.assumedLocalZero = true;
+        return result;
+      }
+      if (!options.allowAmbiguousBare) {
+        result.ambiguous = true;
+        result.reason = 'ambiguous';
+        return result;
+      }
+    }
+
+    if (digits.length < 8) {
+      result.reason = 'too_short';
+      return result;
+    }
+    if (digits.length > 15) {
+      result.reason = 'too_long';
+      return result;
+    }
+    result.valid = true;
+    result.country = 'INTL';
+    result.digits = digits;
+    result.canonical = `+${digits}`;
+    return result;
+  }
+
+  function phoneDigits(value) {
+    const parsed = parsePhoneNumber(value, { allowAmbiguousBare: true });
+    return parsed.valid ? parsed.digits : '';
   }
 
   function normalizePhone(value) {
-    const text = asText(value);
-    if (!text || text.includes('@')) return '';
-    let cleaned = text.replace(/[\s\-().]/g, '');
-    if (cleaned.startsWith('00')) cleaned = `+${cleaned.slice(2)}`;
-    if (!/^\+?\d+$/.test(cleaned)) return '';
-    const digits = cleaned.replace(/\D/g, '');
-    if (digits.length < 8 || digits.length > 15) return '';
-    return `+${digits}`;
+    const parsed = parsePhoneNumber(value);
+    return parsed.valid ? parsed.canonical : '';
   }
 
   function formatPhone(value) {
-    const text = asText(value);
-    if (!text || text.includes('@')) return '';
-    return normalizePhone(text);
+    const parsed = parsePhoneNumber(value, { allowAmbiguousBare: true });
+    return parsed.valid ? parsed.canonical : '';
   }
 
   function phoneFromJid(value) {
@@ -215,6 +302,7 @@
     const text = asText(value);
     if (!text) return false;
     if (text.includes('@')) return false;
+    if (text.toLowerCase() === 'unknown contact') return false;
     if (/^\+?\d[\d\s\-().]*$/.test(text)) return false;
     return true;
   }
@@ -291,6 +379,7 @@
     isPnJid,
     isLidJid,
     phoneDigits,
+    parsePhoneNumber,
     normalizePhone,
     formatPhone,
     phoneFromJid,

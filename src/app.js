@@ -23,7 +23,7 @@ const state = {
 };
 
 const {
-  normalizePhone,
+  parsePhoneNumber,
   formatPhone,
   normalizeJid,
   isPnJid,
@@ -104,10 +104,10 @@ function identityInput(raw) {
     const phone = isPnJid(jid) ? formatPhone(jid.split('@')[0]) : '';
     return { jid, phone, number: phone || jid, key: jid };
   }
-  const phone = normalizePhone(text);
-  if (!phone) return null;
-  const jid = jidFromPhone(phone);
-  return { jid, phone, number: phone, key: jid };
+  const parsed = parsePhoneNumber(text);
+  if (!parsed.valid) return null;
+  const jid = jidFromPhone(parsed.canonical);
+  return { jid, phone: parsed.canonical, number: parsed.canonical, key: jid };
 }
 
 function memberIdentityKeys(member) {
@@ -769,6 +769,11 @@ function renderGroupPage() {
     <main class="content">
       <div class="content-inner">
         ${jobsToShow.length ? `<div class="job-stack">${jobsToShow.map(jobCard).join('')}</div>` : ''}
+        ${summary.adminAccountIds && summary.adminAccountIds.length === 0 ? `<div class="card empty-state" style="padding:20px">
+          <div class="empty-icon" style="background:var(--danger-soft);color:var(--danger)">${icon('shield', 26)}</div>
+          <h3 style="font-size:15px">No verified linked admin</h3>
+          <p>No linked account is currently verified as an admin of this group. Remove and add jobs will stay blocked until an account regains admin access.</p>
+        </div>` : ''}
         <div class="list">
           <div class="group-meta-bar">
             <span>${summary.memberCount} member${summary.memberCount === 1 ? '' : 's'}</span>
@@ -1069,7 +1074,7 @@ function renderMembersPage() {
       </div>
       ${filesMarkup}
       <form class="manual-add" id="manual-form">
-        <input id="manual-number" class="input" type="text" placeholder="Add one number, e.g. +212612345678" autocomplete="off">
+        <input id="manual-number" class="input" type="text" placeholder="Add one number, e.g. 0551234567 or +213551234567" autocomplete="off">
         <button class="btn btn-primary" type="submit" id="manual-submit" aria-label="Add number">${icon('plus', 22)}</button>
       </form>
       ${pickerMarkup}
@@ -1195,6 +1200,7 @@ function renderMembersPage() {
     renderMembersPage();
     let totalAdded = 0;
     let totalInvalid = 0;
+    let totalWarnings = 0;
     const failures = [];
     for (let index = 0; index < files.length; index += 1) {
       const file = files[index];
@@ -1209,6 +1215,7 @@ function renderMembersPage() {
         }
         totalAdded += added;
         totalInvalid += (parsed.stats && parsed.stats.invalid) || 0;
+        totalWarnings += (parsed.stats && parsed.stats.warnings ? parsed.stats.warnings.length : 0);
         ctx.importedFiles.push({
           id: fileId,
           name: file.name,
@@ -1226,7 +1233,8 @@ function renderMembersPage() {
       showToast(failures[0], 'error');
     } else if (totalAdded > 0) {
       const skipped = totalInvalid ? ` ${totalInvalid} invalid row${totalInvalid === 1 ? '' : 's'} skipped.` : '';
-      showToast(`${totalAdded} recipient${totalAdded === 1 ? '' : 's'} added.${skipped}`, 'success');
+      const warned = totalWarnings ? ` ${totalWarnings} number${totalWarnings === 1 ? '' : 's'} needed a local-format assumption.` : '';
+      showToast(`${totalAdded} recipient${totalAdded === 1 ? '' : 's'} added.${skipped}${warned}`, 'success');
     } else {
       showToast('No new valid recipients were found in the selected files.', 'info');
     }
@@ -1243,7 +1251,7 @@ function renderMembersPage() {
       renderMembersPage();
       return;
     }
-    if (result === 'invalid') showToast('Enter a valid international phone number.', 'error');
+    if (result === 'invalid') showToast('Enter a valid phone number: 0551234567 or +213551234567.', 'error');
     else if (result === 'duplicate') showToast('This number is already in the list.', 'info');
     else if (result === 'in-group') showToast('This number is already in the group.', 'info');
     else if (result === 'not-member') showToast('This number is not a member of the group.', 'info');
@@ -1329,6 +1337,16 @@ function accountRow(account) {
   if (account.pausedReason) extras.push(esc(account.pausedReason));
   if (account.needsRelink) extras.push('This account was unlinked remotely. Re-link it to continue.');
   if (account.onboardingError) extras.push(`Onboarding: ${esc(account.onboardingError.split('\n')[0])}`);
+  const blockedGroups = account.adminAccess
+    ? [...(account.adminAccess.notAdmin || []), ...(account.adminAccess.notMember || [])]
+    : [];
+  if (blockedGroups.length) {
+    const names = blockedGroups
+      .map((id) => (state.groups.find((group) => group.id === id) || {}).name)
+      .filter(Boolean);
+    const label = names.length ? names.slice(0, 3).join(', ') : `${blockedGroups.length} group${blockedGroups.length === 1 ? '' : 's'}`;
+    extras.push(`Not a verified admin in ${esc(label)}. This account will not act there.`);
+  }
   return `
     <div class="account-row" data-account-row="${esc(account.id)}">
       ${avatar(account.alias, account.id)}

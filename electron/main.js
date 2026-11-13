@@ -78,6 +78,19 @@ function requireAuth() {
   if (!currentUser) throw new Error('Please log in first.');
 }
 
+function adminAccessSummary(account) {
+  const summary = { verified: [], notAdmin: [], notMember: [], unknown: [] };
+  const access = account.adminAccess && typeof account.adminAccess === 'object' ? account.adminAccess : {};
+  for (const [groupId, entry] of Object.entries(access)) {
+    const status = entry && entry.status;
+    if (status === 'verified') summary.verified.push(groupId);
+    else if (status === 'not_admin') summary.notAdmin.push(groupId);
+    else if (status === 'not_member') summary.notMember.push(groupId);
+    else summary.unknown.push(groupId);
+  }
+  return summary;
+}
+
 function publicAccount(account) {
   return {
     id: account.id,
@@ -96,6 +109,7 @@ function publicAccount(account) {
     lastError: account.lastError,
     pausedReason: account.pausedReason,
     batchPauseUntil: account.batchPauseUntil || 0,
+    adminAccess: adminAccessSummary(account),
     qr: account.qr || null
   };
 }

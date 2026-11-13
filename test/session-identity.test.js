@@ -118,6 +118,7 @@ test('sendAction preserves LID targets and converts phone targets to PN JIDs', a
   manager.sockets.set('acc_1', {
     connected: true,
     sock: {
+      groupMetadata: async () => metadata(),
       groupParticipantsUpdate: async (groupJid, jids, action) => {
         captured = { groupJid, jids, action };
         return jids.map((jid) => ({ status: '200', jid }));
