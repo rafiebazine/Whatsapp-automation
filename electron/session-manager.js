@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
+const { performance } = require('perf_hooks');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const { loadBaileys } = require('./baileys-loader');
@@ -27,8 +28,27 @@ const {
   getContactDisplayName
 } = require('./identity');
 
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: process.env.WGM_LOG_LEVEL || 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const CONTACT_SYNC_BATCH_SIZE = 250;
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function contactNameDetails(contact, fallbackSource) {
+  const name = sanitizeContactName(contact.name)
+    || sanitizeContactName(contact.notify)
+    || sanitizeContactName(contact.verifiedName);
+  const nameSource = sanitizeContactName(contact.name)
+    ? 'whatsapp'
+    : sanitizeContactName(contact.notify)
+      ? 'notify'
+      : sanitizeContactName(contact.verifiedName)
+        ? 'verified'
+        : '';
+  return { name, nameSource: nameSource || fallbackSource };
+}
 
 function targetLabel(target) {
   if (target === null || target === undefined) return '';
@@ -74,6 +94,10 @@ class SessionManager extends EventEmitter {
     this.manualStops = new Set();
     this.onboarding = new Set();
     this.stopping = false;
+    this.contactSyncBatchSize = CONTACT_SYNC_BATCH_SIZE;
+    this.contactIngestChains = new Map();
+    this.lastContactSyncStats = null;
+    this.lastContactIngestStats = null;
   }
 
   setMasterKey(key) {
@@ -526,10 +550,9 @@ class SessionManager extends EventEmitter {
       group.memberCount = group.members.length;
       group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
     }
-    this.db.data.contacts = this.db.data.contacts.map((contact) => ({
-      ...contact,
-      sourceAccounts: (contact.sourceAccounts || []).filter((id) => id !== accountId)
-    }));
+    for (const contact of this.db.data.contacts) {
+      contact.sourceAccounts = (contact.sourceAccounts || []).filter((id) => id !== accountId);
+    }
     this.db.save();
     this.emit('accounts:update');
     this.emit('groups:update');
@@ -537,57 +560,195 @@ class SessionManager extends EventEmitter {
   }
 
   ingestContacts(accountId, contacts) {
-    if (!Array.isArray(contacts)) return;
-    let changed = false;
+    if (!Array.isArray(contacts) || contacts.length === 0) return Promise.resolve(0);
+    const previous = this.contactIngestChains.get(accountId) || Promise.resolve();
+    const run = previous
+      .catch(() => {})
+      .then(() => this.processContactIngest(accountId, contacts))
+      .catch((error) => {
+        console.error('Contact ingest failed:', error);
+        return 0;
+      });
+    this.contactIngestChains.set(accountId, run);
+    run.then(
+      () => {
+        if (this.contactIngestChains.get(accountId) === run) {
+          this.contactIngestChains.delete(accountId);
+        }
+      },
+      () => {
+        if (this.contactIngestChains.get(accountId) === run) {
+          this.contactIngestChains.delete(accountId);
+        }
+      }
+    );
+    return run;
+  }
+
+  async processContactIngest(accountId, contacts) {
+    const startedAt = process.hrtime.bigint();
+    const eventLoopStart = performance.eventLoopUtilization();
+    const contactsBefore = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+    const readIndexStats = () => (typeof this.db.getContactIndexStats === 'function'
+      ? this.db.getContactIndexStats()
+      : null);
+    const indexBefore = readIndexStats();
+    const stats = {
+      accountId,
+      received: contacts.length,
+      uniqueParticipants: 0,
+      created: 0,
+      updated: 0,
+      batches: 0,
+      yields: 0,
+      durationMs: 0,
+      indexHits: 0,
+      indexMisses: 0
+    };
+    const pending = [];
+    const seen = new Set();
+
     for (const contact of contacts) {
       const identity = participantIdentity(contact, contact);
       if (!identity.id) continue;
-      const nameSource = sanitizeContactName(contact.name)
-        ? 'whatsapp'
-        : sanitizeContactName(contact.notify)
-          ? 'notify'
-          : sanitizeContactName(contact.verifiedName)
-            ? 'verified'
-            : '';
-      const name = sanitizeContactName(contact.name) || sanitizeContactName(contact.notify) || sanitizeContactName(contact.verifiedName);
-      this.db.upsertContactIdentity(identity, name, accountId, 'contact', nameSource || 'whatsapp');
-      changed = true;
+      const keys = identityKeys(identity);
+      if (!keys.size) continue;
+      const dedupeKey = Array.from(keys).sort().join('\u0000');
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      const details = contactNameDetails(contact, 'whatsapp');
+      pending.push({ identity, name: details.name, nameSource: details.nameSource });
     }
-    if (changed) {
+
+    stats.uniqueParticipants = pending.length;
+    const batchSize = Math.max(1, Number(this.contactSyncBatchSize) || CONTACT_SYNC_BATCH_SIZE);
+    stats.batches = Math.ceil(pending.length / batchSize);
+    for (let index = 0; index < pending.length; index += 1) {
+      const item = pending[index];
+      const existingCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+      this.db.upsertContactIdentity(item.identity, item.name, accountId, 'contact', item.nameSource);
+      const nextCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+      if (nextCount > existingCount) {
+        stats.created += 1;
+      } else {
+        stats.updated += 1;
+      }
+      if ((index + 1) % batchSize === 0 && index + 1 < pending.length) {
+        stats.yields += 1;
+        await yieldToEventLoop();
+      }
+    }
+
+    if (pending.length > 0) {
       this.db.save();
       this.emit('contacts:update');
     }
+
+    stats.durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    const indexAfter = readIndexStats();
+    if (indexAfter) {
+      stats.indexHits = indexAfter.hits - (indexBefore ? indexBefore.hits : 0);
+      stats.indexMisses = indexAfter.misses - (indexBefore ? indexBefore.misses : 0);
+    }
+    stats.contactsAdded = (Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0) - contactsBefore;
+    const eventLoopEnd = performance.eventLoopUtilization();
+    const eventLoopDelta = performance.eventLoopUtilization(eventLoopEnd, eventLoopStart);
+    stats.eventLoopUtilization = eventLoopDelta.utilization;
+    stats.eventLoopActiveMs = eventLoopDelta.active;
+    stats.eventLoopIdleMs = eventLoopDelta.idle;
+    this.lastContactIngestStats = stats;
+    logger.info({ event: 'contacts:ingest', ...stats }, 'contact ingest completed');
+    return stats.uniqueParticipants;
   }
 
   async syncContacts(accountId) {
     const entry = this.sockets.get(accountId);
     if (!entry || !entry.connected) return 0;
-    let count = 0;
+
+    const startedAt = process.hrtime.bigint();
+    const eventLoopStart = performance.eventLoopUtilization();
+    const contactsBefore = this.db.data.contacts.length;
+    const readIndexStats = () => (typeof this.db.getContactIndexStats === 'function'
+      ? this.db.getContactIndexStats()
+      : null);
+    const indexBefore = readIndexStats();
+    const stats = {
+      accountId,
+      groupCount: 0,
+      participantOccurrences: 0,
+      uniqueParticipants: 0,
+      created: 0,
+      updated: 0,
+      batches: 0,
+      yields: 0,
+      durationMs: 0,
+      indexHits: 0,
+      indexMisses: 0
+    };
+
     try {
       const groups = await entry.sock.groupFetchAllParticipating();
-      for (const metadata of Object.values(groups || {})) {
+      const groupList = Object.values(groups || {});
+      stats.groupCount = groupList.length;
+
+      const pending = [];
+      const seen = new Set();
+      for (const metadata of groupList) {
         for (const participant of metadata.participants || []) {
+          stats.participantOccurrences += 1;
           const identity = participantIdentity(participant, participant);
           if (!identity.id) continue;
-          const nameSource = sanitizeContactName(participant.name)
-            ? 'participant'
-            : sanitizeContactName(participant.notify)
-              ? 'notify'
-              : sanitizeContactName(participant.verifiedName)
-                ? 'verified'
-                : '';
-          const name = sanitizeContactName(participant.name) || sanitizeContactName(participant.notify) || sanitizeContactName(participant.verifiedName);
-          this.db.upsertContactIdentity(identity, name, accountId, 'group', nameSource || 'participant');
-          count += 1;
+          const keys = identityKeys(identity);
+          if (!keys.size) continue;
+          const dedupeKey = Array.from(keys).sort().join('\u0000');
+          if (seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
+          const details = contactNameDetails(participant, 'participant');
+          pending.push({ identity, name: details.name, nameSource: details.nameSource });
         }
       }
+
+      stats.uniqueParticipants = pending.length;
+      const batchSize = Math.max(1, Number(this.contactSyncBatchSize) || CONTACT_SYNC_BATCH_SIZE);
+      stats.batches = Math.ceil(pending.length / batchSize);
+      for (let index = 0; index < pending.length; index += 1) {
+        const item = pending[index];
+        const existingCount = this.db.data.contacts.length;
+        this.db.upsertContactIdentity(item.identity, item.name, accountId, 'group', item.nameSource);
+        if (this.db.data.contacts.length > existingCount) {
+          stats.created += 1;
+        } else {
+          stats.updated += 1;
+        }
+        if ((index + 1) % batchSize === 0 && index + 1 < pending.length) {
+          stats.yields += 1;
+          await yieldToEventLoop();
+        }
+      }
+
       this.db.save();
       this.emit('contacts:update');
     } catch (error) {
       console.error('Contact sync failed:', error);
       throw error;
+    } finally {
+      stats.durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      const indexAfter = readIndexStats();
+      if (indexAfter) {
+        stats.indexHits = indexAfter.hits - (indexBefore ? indexBefore.hits : 0);
+        stats.indexMisses = indexAfter.misses - (indexBefore ? indexBefore.misses : 0);
+      }
+      stats.contactsAdded = this.db.data.contacts.length - contactsBefore;
+      const eventLoopEnd = performance.eventLoopUtilization();
+      const eventLoopDelta = performance.eventLoopUtilization(eventLoopEnd, eventLoopStart);
+      stats.eventLoopUtilization = eventLoopDelta.utilization;
+      stats.eventLoopActiveMs = eventLoopDelta.active;
+      stats.eventLoopIdleMs = eventLoopDelta.idle;
+      this.lastContactSyncStats = stats;
+      logger.info({ event: 'contacts:sync', ...stats }, 'contact sync completed');
     }
-    return count;
+
+    return stats.uniqueParticipants;
   }
 
   async refreshAllContacts() {

@@ -52,6 +52,18 @@ class Database {
   constructor(filePath) {
     this.filePath = filePath;
     this.data = defaultData();
+    this.contactIndex = new Map();
+    this.contactIndexPositions = new WeakMap();
+    this.contactIndexReady = false;
+    this.contactIndexStats = {
+      lookups: 0,
+      hits: 0,
+      misses: 0,
+      keyChecks: 0,
+      rebuilds: 0,
+      rebuildMs: 0,
+      contactsScanned: 0
+    };
   }
 
   load() {
@@ -87,6 +99,7 @@ class Database {
       this.data = defaultData();
       this.save();
     }
+    this.rebuildContactIndex();
     return this.data;
   }
 
@@ -178,16 +191,86 @@ class Database {
     }
   }
 
-  findContact(value) {
-    const keys = identityKeys(value);
-    if (!keys.size) return null;
-    return this.data.contacts.find((contact) => {
-      const contactKeys = identityKeys(contact);
-      for (const key of contactKeys) {
-        if (keys.has(key)) return true;
+  rebuildContactIndex() {
+    const startedAt = process.hrtime.bigint();
+    this.contactIndex = new Map();
+    this.contactIndexPositions = new WeakMap();
+    const contacts = Array.isArray(this.data.contacts) ? this.data.contacts : [];
+    for (let position = 0; position < contacts.length; position += 1) {
+      const contact = contacts[position];
+      if (!contact || typeof contact !== 'object') continue;
+      this.contactIndexPositions.set(contact, position);
+      for (const key of identityKeys(contact)) {
+        if (!this.contactIndex.has(key)) {
+          this.contactIndex.set(key, contact);
+        }
       }
-      return false;
-    }) || null;
+    }
+    this.contactIndexReady = true;
+    this.contactIndexStats.rebuilds += 1;
+    this.contactIndexStats.rebuildMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  }
+
+  ensureContactIndex() {
+    if (!this.contactIndexReady) this.rebuildContactIndex();
+  }
+
+  indexContact(contact, position) {
+    if (!contact || typeof contact !== 'object') return;
+    if (!this.contactIndexPositions.has(contact)) {
+      const resolvedPosition = typeof position === 'number'
+        ? position
+        : this.data.contacts.indexOf(contact);
+      if (resolvedPosition >= 0) {
+        this.contactIndexPositions.set(contact, resolvedPosition);
+      }
+    }
+    for (const key of identityKeys(contact)) {
+      if (!this.contactIndex.has(key)) {
+        this.contactIndex.set(key, contact);
+      }
+    }
+  }
+
+  getContactIndexStats() {
+    return {
+      ...this.contactIndexStats,
+      size: this.contactIndex.size,
+      contacts: Array.isArray(this.data.contacts) ? this.data.contacts.length : 0,
+      ready: this.contactIndexReady
+    };
+  }
+
+  findContact(value) {
+    this.ensureContactIndex();
+    const keys = identityKeys(value);
+    this.contactIndexStats.lookups += 1;
+    if (!keys.size) {
+      this.contactIndexStats.misses += 1;
+      return null;
+    }
+
+    let match = null;
+    let matchPosition = Infinity;
+    for (const key of keys) {
+      this.contactIndexStats.keyChecks += 1;
+      const contact = this.contactIndex.get(key);
+      if (!contact) continue;
+      const position = this.contactIndexPositions.has(contact)
+        ? this.contactIndexPositions.get(contact)
+        : this.data.contacts.indexOf(contact);
+      if (position >= 0 && position < matchPosition) {
+        match = contact;
+        matchPosition = position;
+      }
+    }
+
+    if (match) {
+      this.contactIndexStats.hits += 1;
+      return match;
+    }
+    this.contactIndexStats.misses += 1;
+    return null;
   }
 
   upsertContact(phoneNumber, name, accountId) {
@@ -213,6 +296,7 @@ class Database {
         sourceTypes: sourceType ? [sourceType] : [],
         lastSyncedAt: now
       };
+      this.indexContact(contact, this.data.contacts.length);
       this.data.contacts.push(contact);
       return contact;
     }
@@ -243,6 +327,7 @@ class Database {
       contact.sourceTypes.push(sourceType);
     }
     contact.lastSyncedAt = now;
+    this.indexContact(contact);
     return contact;
   }
 
