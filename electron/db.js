@@ -3,6 +3,8 @@ const path = require('path');
 const crypto = require('crypto');
 const {
   normalizeJid,
+  isPnJid,
+  isLidJid,
   phoneDigits,
   phoneFromJid,
   jidFromPhone,
@@ -331,6 +333,88 @@ class Database {
     contact.lastSyncedAt = now;
     this.indexContact(contact);
     return contact;
+  }
+
+  linkContactIdentities(identity, accountId) {
+    this.ensureContactIndex();
+    const normalized = participantIdentity(identity, identity);
+    const keys = identityKeys(normalized);
+    if (!keys.size) return { contact: null, changed: false };
+
+    const matches = [];
+    const seen = new Set();
+    for (const key of keys) {
+      const contact = this.contactIndex.get(key);
+      if (contact && !seen.has(contact)) {
+        seen.add(contact);
+        matches.push(contact);
+      }
+    }
+
+    if (matches.length === 0) {
+      const contact = this.upsertContactIdentity(normalized, '', accountId, 'mapping', '');
+      return { contact, changed: Boolean(contact) };
+    }
+
+    const positionOf = (contact) => (this.contactIndexPositions.has(contact)
+      ? this.contactIndexPositions.get(contact)
+      : this.data.contacts.indexOf(contact));
+    matches.sort((first, second) => positionOf(first) - positionOf(second));
+    const primary = matches[0];
+    let changed = false;
+
+    for (const duplicate of matches.slice(1)) {
+      const primaryName = sanitizeContactName(primary.name);
+      const duplicateName = sanitizeContactName(duplicate.name);
+      const primaryPriority = NAME_SOURCE_PRIORITY[primary.nameSource] || (primaryName ? 1 : 0);
+      const duplicatePriority = NAME_SOURCE_PRIORITY[duplicate.nameSource] || (duplicateName ? 1 : 0);
+      const duplicateLid = isLidJid(duplicate.id) ? normalizeJid(duplicate.id) : '';
+      const duplicateJid = isPnJid(duplicate.id) ? normalizeJid(duplicate.id) : '';
+      mergeContactRecords(primary, duplicate);
+      if (duplicateLid && !primary.lid) primary.lid = duplicateLid;
+      if (duplicateJid && !primary.jid) primary.jid = duplicateJid;
+      if (!sanitizeContactName(primary.localName) && sanitizeContactName(duplicate.localName)) {
+        primary.localName = sanitizeContactName(duplicate.localName);
+      }
+      if (duplicateName && (!primaryName || duplicatePriority > primaryPriority)) {
+        primary.name = duplicateName;
+        primary.nameSource = duplicate.nameSource;
+      }
+      if (duplicate.lastSyncedAt && (!primary.lastSyncedAt || duplicate.lastSyncedAt > primary.lastSyncedAt)) {
+        primary.lastSyncedAt = duplicate.lastSyncedAt;
+      }
+      const duplicatePosition = this.data.contacts.indexOf(duplicate);
+      if (duplicatePosition >= 0) {
+        this.data.contacts.splice(duplicatePosition, 1);
+        changed = true;
+      }
+    }
+
+    const keysBefore = identityKeys(primary);
+    if (!primary.id) primary.id = normalized.id || '';
+    if (!primary.jid && normalized.jid) primary.jid = normalized.jid;
+    if (!primary.lid && normalized.lid) primary.lid = normalized.lid;
+    if (!primary.phoneNumber && normalized.phoneNumber) primary.phoneNumber = normalized.phoneNumber;
+    if (identityKeys(primary).size !== keysBefore.size) changed = true;
+    if (!Array.isArray(primary.sourceAccounts)) primary.sourceAccounts = [];
+    if (accountId && !primary.sourceAccounts.includes(accountId)) {
+      primary.sourceAccounts.push(accountId);
+      changed = true;
+    }
+    if (!Array.isArray(primary.sourceTypes)) primary.sourceTypes = [];
+    if (!primary.sourceTypes.includes('mapping')) {
+      primary.sourceTypes.push('mapping');
+      changed = true;
+    }
+    if (changed) {
+      primary.lastSyncedAt = new Date().toISOString();
+      if (matches.length > 1) {
+        this.rebuildContactIndex();
+      } else {
+        this.indexContact(primary);
+      }
+    }
+    return { contact: primary, changed };
   }
 
   enrichMember(member) {

@@ -28,13 +28,38 @@ const {
   sanitizeContactName,
   getContactDisplayName
 } = require('./identity');
+const contactDiagnostics = require('./contact-diagnostics');
 
 const logger = pino({ level: process.env.WGM_LOG_LEVEL || 'silent' });
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const CONTACT_SYNC_BATCH_SIZE = 250;
+const APP_STATE_CONTACT_COLLECTION = 'critical_unblock_low';
+const HISTORY_SYNC_INITIAL_BOOTSTRAP = 0;
+const HISTORY_SYNC_RECENT = 3;
+const HISTORY_SYNC_PUSH_NAME = 4;
+const ALLOWED_HISTORY_SYNC_TYPES = new Set([
+  HISTORY_SYNC_INITIAL_BOOTSTRAP,
+  HISTORY_SYNC_RECENT,
+  HISTORY_SYNC_PUSH_NAME
+]);
 
 function yieldToEventLoop() {
   return new Promise((resolve) => setImmediate(resolve));
+}
+
+function shouldProcessHistorySync(message) {
+  contactDiagnostics.recordHistoryPredicate(message);
+  return Boolean(message && ALLOWED_HISTORY_SYNC_TYPES.has(message.syncType));
+}
+
+function logRawGroupParticipants(source, metadata) {
+  if (process.env.WGM_DIAGNOSTIC_PARTICIPANTS !== '1') return;
+  const groupId = metadata && metadata.id;
+  const participants = metadata && metadata.participants;
+  console.log(
+    `[GROUP PARTICIPANTS RAW] ${source} ${groupId || ''}`,
+    JSON.stringify(participants, null, 2)
+  );
 }
 
 function contactNameDetails(contact, fallbackSource) {
@@ -105,6 +130,8 @@ class SessionManager extends EventEmitter {
     this.contactIngestChains = new Map();
     this.lastContactSyncStats = null;
     this.lastContactIngestStats = null;
+    this.lastAppStateResyncStats = null;
+    this.appStateForcedSnapshots = new Set();
   }
 
   setMasterKey(key) {
@@ -238,6 +265,7 @@ class SessionManager extends EventEmitter {
       return { status: 'unknown', error: message };
     }
 
+    logRawGroupParticipants('groupMetadata', metadata);
     this.applyMetadataToGroup(group, metadata, account, true);
     const status = this.recordAdminAccess(account, group, metadata);
     this.db.save();
@@ -273,6 +301,7 @@ class SessionManager extends EventEmitter {
     for (const group of this.db.data.groups) {
       const metadata = groups[group.id];
       if (metadata) {
+        logRawGroupParticipants('groupFetchAllParticipating', metadata);
         this.applyMetadataToGroup(group, metadata, account, true);
         this.recordAdminAccess(account, group, metadata);
       } else {
@@ -315,7 +344,12 @@ class SessionManager extends EventEmitter {
 
     const baileys = await loadBaileys();
     const makeWASocket = baileys.default;
-    const { fetchLatestBaileysVersion, DisconnectReason, Browsers } = baileys;
+    const {
+      fetchLatestBaileysVersion,
+      DisconnectReason,
+      Browsers,
+      ALL_WA_PATCH_NAMES
+    } = baileys;
 
     let version;
     try {
@@ -335,6 +369,7 @@ class SessionManager extends EventEmitter {
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      shouldSyncHistoryMessage: shouldProcessHistorySync,
       generateHighQualityLinkPreview: false,
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: 60000,
@@ -343,7 +378,25 @@ class SessionManager extends EventEmitter {
       getMessage: async () => undefined
     });
 
-    const entry = { sock, connected: false, saveCreds: authState.saveCreds, syncing: false };
+    const entry = {
+      sock,
+      connected: false,
+      saveCreds: authState.saveCreds,
+      syncing: false,
+      authKeys: authState.state.keys,
+      appStatePatchNames: ALL_WA_PATCH_NAMES,
+      appStateResyncStarted: false,
+      appStateResyncPromise: null,
+      appStateResyncStatus: 'pending',
+      appStateResyncStartedAt: null,
+      appStateResyncCompletedAt: null,
+      appStateResyncError: '',
+      appStateResyncEvents: 0,
+      appStateResyncContacts: 0,
+      appStateResyncNamedContacts: 0,
+      appStateResyncIdentities: new Set(),
+      appStateResyncForcedSnapshot: false
+    };
     this.sockets.set(accountId, entry);
     this.manualStops.delete(accountId);
 
@@ -402,6 +455,12 @@ class SessionManager extends EventEmitter {
           this.emit('connection:open', { accountId: account.id });
           this.syncContacts(account.id).catch(() => {});
           this.refreshAdminAccess(account.id).catch(() => {});
+          this.resyncAccountAppState(account.id).catch((error) => {
+            console.error('[APP-STATE] Resync invocation failed', {
+              accountId: account.id,
+              error: error && error.message ? error.message : String(error)
+            });
+          });
           if (account.pendingOnboarding) {
             this.onboardAccount(account.id).catch(() => {});
           }
@@ -443,17 +502,33 @@ class SessionManager extends EventEmitter {
     });
 
     sock.ev.on('contacts.upsert', (contacts) => {
-      this.ingestContacts(account.id, contacts);
+      this.handleContactsUpsert(account.id, contacts);
     });
 
     sock.ev.on('contacts.update', (contacts) => {
-      this.ingestContacts(account.id, contacts);
+      contactDiagnostics.recordContactBatch('contacts.update', contacts, this.db);
+      this.ingestContacts(account.id, contacts, { event: 'contacts.update' });
     });
 
     sock.ev.on('messaging-history.set', (data) => {
-      if (data && Array.isArray(data.contacts)) {
-        this.ingestContacts(account.id, data.contacts);
-      }
+      contactDiagnostics.recordHistory(data);
+      this.ingestHistory(account.id, data);
+    });
+
+    sock.ev.on('chats.upsert', (chats) => {
+      this.ingestChats(account.id, chats, 'chats.upsert');
+    });
+
+    sock.ev.on('chats.update', (chats) => {
+      this.ingestChats(account.id, chats, 'chats.update');
+    });
+
+    sock.ev.on('chats.phoneNumberShare', (share) => {
+      this.linkContactIdentities(account.id, share);
+    });
+
+    sock.ev.on('messages.upsert', (event) => {
+      contactDiagnostics.recordMessages(account.id, event, this.db);
     });
 
     sock.ev.on('groups.update', (updates) => {
@@ -684,33 +759,299 @@ class SessionManager extends EventEmitter {
     return true;
   }
 
-  ingestContacts(accountId, contacts) {
-    if (!Array.isArray(contacts) || contacts.length === 0) return Promise.resolve(0);
+  enqueueContactWork(accountId, work) {
     const previous = this.contactIngestChains.get(accountId) || Promise.resolve();
     const run = previous
       .catch(() => {})
-      .then(() => this.processContactIngest(accountId, contacts))
+      .then(work)
       .catch((error) => {
-        console.error('Contact ingest failed:', error);
+        console.error('Contact work failed:', error);
         return 0;
       });
     this.contactIngestChains.set(accountId, run);
-    run.then(
-      () => {
-        if (this.contactIngestChains.get(accountId) === run) {
-          this.contactIngestChains.delete(accountId);
-        }
-      },
-      () => {
-        if (this.contactIngestChains.get(accountId) === run) {
-          this.contactIngestChains.delete(accountId);
-        }
+    const cleanup = () => {
+      if (this.contactIngestChains.get(accountId) === run) {
+        this.contactIngestChains.delete(accountId);
       }
-    );
+    };
+    run.then(cleanup, cleanup);
     return run;
   }
 
-  async processContactIngest(accountId, contacts) {
+  countNamedContacts() {
+    const contacts = Array.isArray(this.db.data.contacts) ? this.db.data.contacts : [];
+    return contacts.reduce((count, contact) => count + (sanitizeContactName(contact.name) ? 1 : 0), 0);
+  }
+
+  countNamedGroupMembers() {
+    let total = 0;
+    let named = 0;
+    const groups = Array.isArray(this.db.data.groups) ? this.db.data.groups : [];
+    for (const group of groups) {
+      for (const member of group.members || []) {
+        total += 1;
+        if (this.db.contactName(member)) named += 1;
+      }
+    }
+    return { total, named };
+  }
+
+  flushBufferedSocketEvents(entry) {
+    const ev = entry && entry.sock && entry.sock.ev;
+    if (ev && typeof ev.flush === 'function') ev.flush();
+  }
+
+  async waitForContactIngest(accountId) {
+    let chain = this.contactIngestChains.get(accountId);
+    while (chain) {
+      await chain.catch(() => {});
+      const current = this.contactIngestChains.get(accountId);
+      if (!current || current === chain) break;
+      chain = current;
+    }
+  }
+
+  handleContactsUpsert(accountId, contacts) {
+    if (!Array.isArray(contacts) || contacts.length === 0) return Promise.resolve(0);
+    const entry = this.sockets.get(accountId);
+    if (entry && entry.appStateResyncStatus === 'running') {
+      entry.appStateResyncEvents += 1;
+      if (!(entry.appStateResyncIdentities instanceof Set)) {
+        entry.appStateResyncIdentities = new Set();
+      }
+      for (const contact of contacts) {
+        entry.appStateResyncContacts += 1;
+        if (contactNameDetails(contact, '').name) entry.appStateResyncNamedContacts += 1;
+        const identity = participantIdentity(contact, contact);
+        const keys = identityKeys(identity);
+        if (keys.size > 0) {
+          entry.appStateResyncIdentities.add(Array.from(keys).sort().join('\u0000'));
+        }
+      }
+    }
+    contactDiagnostics.recordContactBatch('contacts.upsert', contacts, this.db);
+    return this.ingestContacts(accountId, contacts, { event: 'contacts.upsert' });
+  }
+
+  resyncAccountAppState(accountId) {
+    const entry = this.sockets.get(accountId);
+    if (!entry || !entry.connected || !entry.sock) {
+      return Promise.resolve({ accountId, status: 'skipped', reason: 'not_connected' });
+    }
+    if (entry.appStateResyncStarted) {
+      return entry.appStateResyncPromise || Promise.resolve({ accountId, status: 'skipped', reason: 'already_started' });
+    }
+
+    entry.appStateResyncStarted = true;
+    entry.appStateResyncStatus = 'running';
+    entry.appStateResyncStartedAt = new Date().toISOString();
+    entry.appStateResyncCompletedAt = null;
+    entry.appStateResyncError = '';
+    entry.appStateResyncEvents = 0;
+    entry.appStateResyncContacts = 0;
+    entry.appStateResyncNamedContacts = 0;
+    entry.appStateResyncIdentities = new Set();
+    entry.appStateResyncForcedSnapshot = false;
+
+    const run = this.performAppStateResync(accountId, entry).catch((error) => {
+      entry.appStateResyncStatus = 'failed';
+      entry.appStateResyncCompletedAt = new Date().toISOString();
+      entry.appStateResyncError = error && error.message ? error.message : String(error);
+      const stats = {
+        accountId,
+        status: 'failed',
+        error: entry.appStateResyncError,
+        startedAt: entry.appStateResyncStartedAt,
+        completedAt: entry.appStateResyncCompletedAt,
+        forcedSnapshot: Boolean(entry.appStateResyncForcedSnapshot),
+        contactsUpsertEvents: entry.appStateResyncEvents,
+        contactsReceived: entry.appStateResyncContacts,
+        uniqueContacts: entry.appStateResyncIdentities instanceof Set ? entry.appStateResyncIdentities.size : 0
+      };
+      this.lastAppStateResyncStats = stats;
+      console.error('[APP-STATE] Resync failed', stats);
+      return stats;
+    });
+
+    entry.appStateResyncPromise = run;
+    return run;
+  }
+
+  async performAppStateResync(accountId, entry) {
+    const startedAt = process.hrtime.bigint();
+    const contactsBefore = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+    const namedBefore = this.countNamedContacts();
+    const groupBefore = this.countNamedGroupMembers();
+    console.log('[APP-STATE] Resync started', { accountId });
+
+    if (!Array.isArray(entry.appStatePatchNames) || entry.appStatePatchNames.length === 0) {
+      const error = new Error('Baileys ALL_WA_PATCH_NAMES is unavailable.');
+      error.code = 'APP_STATE_PATCH_NAMES_UNAVAILABLE';
+      throw error;
+    }
+    if (typeof entry.sock.resyncAppState !== 'function') {
+      const error = new Error('Baileys socket does not expose resyncAppState().');
+      error.code = 'APP_STATE_RESYNC_UNAVAILABLE';
+      throw error;
+    }
+
+    const ensureActive = () => {
+      if (this.sockets.get(accountId) !== entry || !entry.connected) {
+        const error = new Error('Account disconnected during app-state resync.');
+        error.code = 'APP_STATE_DISCONNECTED';
+        throw error;
+      }
+    };
+
+    await entry.sock.resyncAppState(entry.appStatePatchNames, true);
+    this.flushBufferedSocketEvents(entry);
+    await this.waitForContactIngest(accountId);
+    ensureActive();
+
+    const namedAfterPlain = this.countNamedContacts();
+    const contactsAfterPlain = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+    const hasUnnamedContacts = contactsAfterPlain > namedAfterPlain;
+    if (
+      entry.appStateResyncEvents === 0
+      && hasUnnamedContacts
+      && !entry.appStateResyncForcedSnapshot
+      && !this.appStateForcedSnapshots.has(accountId)
+    ) {
+      entry.appStateResyncForcedSnapshot = true;
+      console.log('[APP-STATE] Resync forcing critical_unblock_low snapshot', { accountId });
+      if (!entry.authKeys || typeof entry.authKeys.set !== 'function') {
+        const error = new Error('Encrypted auth keys are unavailable for app-state snapshot reset.');
+        error.code = 'APP_STATE_AUTH_KEYS_UNAVAILABLE';
+        throw error;
+      }
+      await entry.authKeys.set({
+        'app-state-sync-version': { [APP_STATE_CONTACT_COLLECTION]: null }
+      });
+      this.appStateForcedSnapshots.add(accountId);
+      await entry.sock.resyncAppState([APP_STATE_CONTACT_COLLECTION], true);
+      this.flushBufferedSocketEvents(entry);
+      await this.waitForContactIngest(accountId);
+      ensureActive();
+    }
+
+    const contactsAfter = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
+    const namedAfter = this.countNamedContacts();
+    const groupAfter = this.countNamedGroupMembers();
+    const uniqueContacts = entry.appStateResyncIdentities instanceof Set
+      ? entry.appStateResyncIdentities.size
+      : 0;
+    const contactsCreated = Math.max(0, contactsAfter - contactsBefore);
+    const status = (entry.appStateResyncNamedContacts > 0 || namedAfter > namedBefore)
+      ? 'completed'
+      : 'completed_no_names';
+    const completedAt = new Date().toISOString();
+    const stats = {
+      accountId,
+      status,
+      startedAt: entry.appStateResyncStartedAt,
+      completedAt,
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1e6,
+      patchCollections: entry.appStatePatchNames.slice(),
+      forcedSnapshot: Boolean(entry.appStateResyncForcedSnapshot),
+      contactsUpsertEvents: entry.appStateResyncEvents,
+      contactsReceived: entry.appStateResyncContacts,
+      namedContactsReceived: entry.appStateResyncNamedContacts,
+      uniqueContacts,
+      contactsBefore,
+      contactsAfter,
+      contactsCreated,
+      contactsUpdated: Math.max(0, uniqueContacts - contactsCreated),
+      namedContactsBefore: namedBefore,
+      namedContactsAfter: namedAfter,
+      namedRecovered: Math.max(0, namedAfter - namedBefore),
+      namedPersisted: namedAfter,
+      groupMembersBefore: groupBefore.named,
+      groupMembersAfter: groupAfter.named,
+      groupMembersEnriched: Math.max(0, groupAfter.named - groupBefore.named)
+    };
+
+    entry.appStateResyncStatus = status;
+    entry.appStateResyncCompletedAt = completedAt;
+    this.lastAppStateResyncStats = stats;
+    console.log(
+      status === 'completed'
+        ? '[APP-STATE] Resync completed'
+        : '[APP-STATE] Resync completed with no new names',
+      stats
+    );
+    return stats;
+  }
+
+  ingestContacts(accountId, contacts, options = {}) {
+    if (!Array.isArray(contacts) || contacts.length === 0) return Promise.resolve(0);
+    return this.enqueueContactWork(accountId, () => this.processContactIngest(accountId, contacts, options));
+  }
+
+  ingestChats(accountId, chats, event = 'chats.upsert') {
+    if (!Array.isArray(chats) || chats.length === 0) return Promise.resolve(0);
+    const contacts = [];
+    const seen = new Set();
+    for (const chat of chats) {
+      if (!chat || !chat.id) continue;
+      const name = sanitizeContactName(chat.name) || sanitizeContactName(chat.displayName);
+      const notify = sanitizeContactName(chat.notify);
+      if (!name && !notify) continue;
+      const identity = participantIdentity({
+        id: chat.id,
+        jid: chat.pnJid || (isPnJid(chat.id) ? chat.id : ''),
+        lid: chat.lidJid || (isLidJid(chat.id) ? chat.id : '')
+      }, {});
+      if (!isPnJid(identity.jid) && !isLidJid(identity.lid)) continue;
+      const keys = identityKeys(identity);
+      if (!keys.size) continue;
+      const dedupeKey = Array.from(keys).sort().join('\u0000');
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      contacts.push({
+        id: identity.id,
+        jid: identity.jid,
+        lid: identity.lid,
+        phoneNumber: identity.phoneNumber,
+        name,
+        notify
+      });
+    }
+    if (contacts.length === 0) return Promise.resolve(0);
+    return this.ingestContacts(accountId, contacts, { sourceType: 'chat', event });
+  }
+
+  ingestHistory(accountId, data) {
+    if (!data || typeof data !== 'object') return Promise.resolve(0);
+    const work = [];
+    if (Array.isArray(data.contacts) && data.contacts.length > 0) {
+      work.push(this.ingestContacts(accountId, data.contacts, {
+        sourceType: 'contact',
+        event: 'messaging-history.set.contacts'
+      }));
+    }
+    if (Array.isArray(data.chats) && data.chats.length > 0) {
+      work.push(this.ingestChats(accountId, data.chats, 'messaging-history.set.chats'));
+    }
+    if (work.length === 0) return Promise.resolve(0);
+    return Promise.all(work).then((counts) => counts.reduce((total, count) => total + (Number(count) || 0), 0));
+  }
+
+  linkContactIdentities(accountId, share) {
+    if (!share || (!share.lid && !share.jid)) return Promise.resolve(0);
+    return this.enqueueContactWork(accountId, () => {
+      const result = this.db.linkContactIdentities(share, accountId);
+      if (!result || !result.contact) return 0;
+      const changed = this.db.refreshCachedDisplayNames([result.contact]);
+      if (result.changed || changed > 0) {
+        this.db.save();
+        this.emit('contacts:update');
+        if (changed > 0) this.emit('groups:update');
+      }
+      return 1;
+    });
+  }
+
+  async processContactIngest(accountId, contacts, options = {}) {
     const startedAt = process.hrtime.bigint();
     const eventLoopStart = performance.eventLoopUtilization();
     const contactsBefore = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
@@ -718,8 +1059,10 @@ class SessionManager extends EventEmitter {
       ? this.db.getContactIndexStats()
       : null);
     const indexBefore = readIndexStats();
+    const sourceType = options.sourceType || 'contact';
     const stats = {
       accountId,
+      sourceType,
       received: contacts.length,
       uniqueParticipants: 0,
       created: 0,
@@ -749,11 +1092,40 @@ class SessionManager extends EventEmitter {
     const batchSize = Math.max(1, Number(this.contactSyncBatchSize) || CONTACT_SYNC_BATCH_SIZE);
     stats.batches = Math.ceil(pending.length / batchSize);
     const touchedContacts = [];
+    const diagnosticsEnabled = contactDiagnostics.isEnabled();
     for (let index = 0; index < pending.length; index += 1) {
       const item = pending[index];
       const existingCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
-      const contact = this.db.upsertContactIdentity(item.identity, item.name, accountId, 'contact', item.nameSource);
+      let diagnosticBefore = null;
+      if (diagnosticsEnabled) {
+        const existing = this.db.findContact(item.identity);
+        diagnosticBefore = {
+          name: existing ? existing.name : '',
+          nameSource: existing ? existing.nameSource : '',
+          displayName: existing ? this.db.contactName(item.identity) : ''
+        };
+      }
+      const contact = this.db.upsertContactIdentity(item.identity, item.name, accountId, sourceType, item.nameSource);
       if (contact) touchedContacts.push(contact);
+      if (diagnosticsEnabled) {
+        const cleanIncoming = sanitizeContactName(item.name);
+        const afterName = contact ? sanitizeContactName(contact.name) : '';
+        const afterDisplay = contact ? this.db.contactName(item.identity) : '';
+        contactDiagnostics.recordWrite({
+          event: options.event || sourceType,
+          accountId,
+          identity: item.identity,
+          incomingName: cleanIncoming,
+          incomingNameSource: item.nameSource,
+          beforeName: diagnosticBefore.name,
+          beforeNameSource: diagnosticBefore.nameSource,
+          beforeDisplayName: diagnosticBefore.displayName,
+          afterName,
+          afterNameSource: contact ? contact.nameSource : '',
+          afterDisplayName: afterDisplay,
+          persisted: Boolean(cleanIncoming && contact && (afterName === cleanIncoming || afterDisplay === cleanIncoming))
+        });
+      }
       const nextCount = Array.isArray(this.db.data.contacts) ? this.db.data.contacts.length : 0;
       if (nextCount > existingCount) {
         stats.created += 1;
@@ -823,6 +1195,7 @@ class SessionManager extends EventEmitter {
       const pending = [];
       const seen = new Set();
       for (const metadata of groupList) {
+        logRawGroupParticipants('groupFetchAllParticipating', metadata);
         for (const participant of metadata.participants || []) {
           stats.participantOccurrences += 1;
           const identity = participantIdentity(participant, participant);
@@ -907,6 +1280,7 @@ class SessionManager extends EventEmitter {
     const groups = await entry.sock.groupFetchAllParticipating();
     const result = [];
     for (const metadata of Object.values(groups || {})) {
+      logRawGroupParticipants('groupFetchAllParticipating', metadata);
       const participants = metadata.participants || [];
       const matchingParticipants = participants.filter((participant) => identityMatches(participant, account));
       const me = matchingParticipants.find((participant) => participantIsAdmin(participant)) || matchingParticipants[0];
@@ -1039,6 +1413,7 @@ class SessionManager extends EventEmitter {
         console.error(`Failed fetching metadata for ${groupId}:`, error);
         throw new Error(`Could not load group details: ${friendlyError(error)}`);
       }
+      logRawGroupParticipants('groupMetadata', metadata);
       const newGroup = {
         id: metadata.id,
         name: metadata.subject || 'Unnamed group',
@@ -1089,6 +1464,7 @@ class SessionManager extends EventEmitter {
       const entry = this.sockets.get(account.id);
       try {
         const metadata = await entry.sock.groupMetadata(groupId);
+        logRawGroupParticipants('groupMetadata', metadata);
         this.applyMetadataToGroup(group, metadata, account, true);
         this.recordAdminAccess(account, group, metadata);
         this.db.save();
@@ -1192,6 +1568,7 @@ class SessionManager extends EventEmitter {
       const entry = this.sockets.get(account.id);
       try {
         const metadata = await entry.sock.groupMetadata(group.id);
+        logRawGroupParticipants('groupMetadata', metadata);
         const me = (metadata.participants || []).find(
           (participant) => identityMatches(participant, account)
         );
@@ -1309,5 +1686,6 @@ module.exports = {
   SessionManager,
   normalizePhone,
   phoneFromJid,
-  friendlyError
+  friendlyError,
+  shouldProcessHistorySync
 };
