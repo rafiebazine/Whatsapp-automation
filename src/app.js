@@ -1199,6 +1199,7 @@ function renderMembersPage() {
     ctx.importing = true;
     renderMembersPage();
     let totalAdded = 0;
+    let totalPersisted = 0;
     let totalInvalid = 0;
     let totalWarnings = 0;
     const failures = [];
@@ -1207,6 +1208,8 @@ function renderMembersPage() {
       try {
         const bytes = new Uint8Array(await file.arrayBuffer());
         const parsed = await call('import:parse', [file.name, bytes], { silent: true });
+        const persisted = await call('contacts:import', [parsed.rows], { silent: true });
+        totalPersisted += persisted.imported || 0;
         const fileId = `file_${Date.now()}_${index}_${Math.random().toString(36).slice(2, 8)}`;
         const source = { type: 'file', fileId, fileName: file.name, label: file.name };
         let added = 0;
@@ -1235,17 +1238,32 @@ function renderMembersPage() {
       const skipped = totalInvalid ? ` ${totalInvalid} invalid row${totalInvalid === 1 ? '' : 's'} skipped.` : '';
       const warned = totalWarnings ? ` ${totalWarnings} number${totalWarnings === 1 ? '' : 's'} needed a local-format assumption.` : '';
       showToast(`${totalAdded} recipient${totalAdded === 1 ? '' : 's'} added.${skipped}${warned}`, 'success');
+    } else if (totalPersisted > 0) {
+      showToast('Contacts were saved, but no new recipients were added to the pending list.', 'info');
     } else {
       showToast('No new valid recipients were found in the selected files.', 'info');
     }
   });
 
   const manualForm = document.getElementById('manual-form');
-  manualForm.addEventListener('submit', (event) => {
+  manualForm.addEventListener('submit', async (event) => {
     event.preventDefault();
     const input = document.getElementById('manual-number');
     const value = input.value.trim();
     if (!value) return;
+    const target = identityInput(value);
+    if (!target) {
+      showToast('Enter a valid phone number: 0551234567 or +213551234567.', 'error');
+      input.select();
+      return;
+    }
+    try {
+      await call('contacts:import', [[{ number: target.number, jid: target.jid, name: '' }]], { silent: true });
+    } catch (error) {
+      showToast(error.message, 'error');
+      input.select();
+      return;
+    }
     const result = addPendingNumber(value, '');
     if (result === 'added') {
       renderMembersPage();

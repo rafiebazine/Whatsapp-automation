@@ -17,6 +17,7 @@ const INVOKE_CHANNELS = new Set([
   'jobs:dismiss',
   'contacts:list',
   'contacts:refresh',
+  'contacts:import',
   'accounts:list',
   'accounts:add',
   'accounts:relink',

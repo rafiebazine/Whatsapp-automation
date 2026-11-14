@@ -12,6 +12,7 @@ const {
 } = require('./identity');
 const { QueueManager } = require('./queue');
 const { parseSpreadsheet } = require('./spreadsheet');
+const { importContacts } = require('./contact-import');
 const { runWithTimeout } = require('./lifecycle');
 
 const STARTUP_STARTED_AT = Date.now();
@@ -574,6 +575,29 @@ function registerIpc() {
       count: db.data.contacts.length,
       synced: result.total,
       failed: result.failed
+    };
+  });
+
+  handle('contacts:import', async (rows) => {
+    requireAuth();
+    if (!Array.isArray(rows)) throw new Error('Invalid contact import.');
+    const result = importContacts(db, rows);
+    let namesChanged = 0;
+    if (result.imported > 0) {
+      namesChanged = db.refreshCachedDisplayNames(result.contacts);
+      db.save();
+      broadcast('contacts:update', { count: db.data.contacts.length });
+      if (namesChanged > 0) {
+        broadcast('groups:update', db.data.groups.map(fullGroup));
+      }
+    }
+    return {
+      imported: result.imported,
+      named: result.named,
+      unnamed: result.unnamed,
+      skipped: result.skipped,
+      count: db.data.contacts.length,
+      namesChanged
     };
   });
 
