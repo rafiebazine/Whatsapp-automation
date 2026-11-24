@@ -39,7 +39,7 @@ CSV rows are preflighted, and contact import rows are limited to 10 keys and 1,0
 - `npm run signing:status` reports whether certificate environment variables are configured without printing their values
 - `npm run verify:artifacts` reports Authenticode status on Windows and explicit unsigned status for AppImages
 - `npm run release:verify` exits nonzero when a Windows artifact is not validly signed
-- `.github/workflows/security-ci.yml` runs tests and audit on Ubuntu and Windows
+- `.github/workflows/security-ci.yml` runs audit, full tests, security tests, signing-status, build, checksum, and artifact verification on Ubuntu and Windows
 - `.github/workflows/release.yml` builds both platforms; tagged releases require `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` and fail closed if they are absent
 
 Verify a packaged build:
@@ -60,13 +60,24 @@ Expected fuses: `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNode
 
 - Database, vault, and auth-state write failures raise `db_persist_failed`, `vault_persist_failed`, or `auth_persist_failed`.
 - IPC returns a generic retry message for these codes and does not expose local paths or certificate values.
-- Queue execution persists `running` state before sending. Post-send persistence failures pause the queue and surface an error; the external WhatsApp action is not undone.
+- Queue execution persists an `uncertain` target before sending. Missing confirmation, ambiguous transport errors, post-send persistence failures, and interrupted work remain `uncertain`; jobs with uncertain work become `needs-review` and are never auto-retried.
 - Auth-state writes retry transient file errors three times, then mark the account `needsRelink` and close its socket.
 - Windows ACL failures, including inherited entries or unverifiable full control, are fatal for the write rather than best-effort.
 
 ## Signing
 
 No code-signing certificates are configured in this repository. Local Windows artifacts will be unsigned, and Linux AppImages are not Authenticode-signed. Tagged releases require protected CI secrets `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`; the release workflow refuses a tagged unsigned build. Manual development builds may be explicitly unsigned. Distribute checksums through a trusted channel and rebuild from reviewed source when possible.
+
+## Windows smoke check
+
+On a real Windows runner or workstation, after installing a built artifact:
+
+1. Confirm the installer or portable executable is the expected artifact and record `Get-AuthenticodeSignature` status. If it is not `Valid`, treat it as unsigned and do not present it as a signed release.
+2. Start the app, complete encrypted setup/login, and inspect the data directory with `icacls`. Only the current user, `SYSTEM`, and `Administrators` may have `(F)`; inherited entries must be absent.
+3. Trigger an auth-state write, then re-run `icacls` on `sessions/<account-id>/auth.enc` and confirm the same restrictive grant.
+4. Lock and unlock the app to confirm encrypted startup still works and no plaintext database is written.
+
+This smoke check is not a substitute for Requirement 18.8's native CI job; it is the manual artifact/ACL verification step.
 
 ## Linux sandbox note
 

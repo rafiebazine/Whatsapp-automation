@@ -126,7 +126,7 @@ async function finishUnlock(dek, options = {}) {
     broadcast('auth:changed', { authenticated: true });
     return { username: currentUser, mustChangePassword };
   } catch (error) {
-    if (db && db.mode === 'encrypted') db.lock();
+    if (db) db.lock();
     if (vault) vault.lock();
     currentUser = null;
     mustChangePassword = false;
@@ -276,6 +276,7 @@ function serializeJob(job) {
     successCount: job.successCount || 0,
     failedCount: job.failedCount || 0,
     skippedCount: job.skippedCount || 0,
+    uncertainCount: job.uncertainCount || 0,
     errors: job.errors || [],
     blockedReason: job.blockedReason || null,
     dismissed: Boolean(job.dismissed)
@@ -389,6 +390,7 @@ const IPC_SCHEMAS = {
   'jobs:create': ['object'],
   'jobs:list': [],
   'jobs:dismiss': ['string'],
+  'jobs:verify-uncertain': ['string'],
   'contacts:list': [],
   'contacts:refresh': [],
   'contacts:import': ['array'],
@@ -904,6 +906,13 @@ function registerIpc() {
     return queue.dismissJob(requiredId(jobId, 'Job'));
   });
 
+  handle('jobs:verify-uncertain', async (jobId) => {
+    requireRecentAuth();
+    const resolved = await queue.reviewUncertainJob(requiredId(jobId, 'Job'));
+    broadcast('jobs:update', serializeJobs());
+    return resolved;
+  });
+
   handle('contacts:list', async () => {
     requireAuth();
     return serializeContacts();
@@ -1022,16 +1031,16 @@ async function boot() {
   };
 
   await stage('Initializing directories', () => {
-    ensurePrivateDir(DATA_DIR);
-    ensurePrivateDir(SESSIONS_DIR);
+    ensurePrivateDir(DATA_DIR, { root: DATA_DIR });
+    ensurePrivateDir(SESSIONS_DIR, { root: DATA_DIR });
     contactDiagnostics.configure(DATA_DIR);
   });
   await stage('Loading local security vault', () => {
-    vault = new AuthVault(VAULT_FILE);
+    vault = new AuthVault(VAULT_FILE, { root: DATA_DIR });
     vault.load();
   });
   await stage('Loading database', () => {
-    db = new Database(DB_FILE);
+    db = new Database(DB_FILE, { root: DATA_DIR });
     db.setPersistenceErrorHandler(() => {
       if (queue) queue.pause();
       broadcast('toast', {

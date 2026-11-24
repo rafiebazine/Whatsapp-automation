@@ -31,7 +31,8 @@ async function migrateLegacySessions({ accounts, sessionsRoot, oldKey, newKey })
         path.join(sessionsRoot, folderName),
         oldKey,
         newKey,
-        account.id
+        account.id,
+        { root: sessionsRoot }
       );
       if (changed) {
         result.migrated += 1;
@@ -55,8 +56,10 @@ async function encryptLegacyDatabase({ db, filePath, dek, oldKey = null, session
   const previousMode = db.mode;
   const previousKey = db.encryptionKey ? Buffer.from(db.encryptionKey) : null;
   let verified = false;
+  let encryptedOnDisk = false;
   let newMasterKey = null;
   let migration = null;
+  const rollbackFailures = [];
   try {
     newMasterKey = crypto.randomBytes(32);
     migration = await migrateLegacySessions({
@@ -71,14 +74,17 @@ async function encryptLegacyDatabase({ db, filePath, dek, oldKey = null, session
       sessionMasterKey: newMasterKey.toString('base64')
     };
     db.useEncryptedData(db.data, dek);
-    const verifier = new Database(filePath);
+    encryptedOnDisk = true;
+    const verifier = new Database(filePath, { root: path.dirname(filePath) });
     const unlocked = verifier.unlock(Buffer.from(dek));
     if (!unlocked || !unlocked.security || !unlocked.security.sessionMasterKey) {
       throw new Error('The encrypted database could not be verified after migration.');
     }
     verified = true;
     const backup = `${filePath}.migrated-${Date.now()}.enc`;
-    writeFileAtomicPrivate(backup, fs.readFileSync(filePath, 'utf8'));
+    writeFileAtomicPrivate(backup, fs.readFileSync(filePath, 'utf8'), 'utf8', {
+      root: path.dirname(filePath)
+    });
     return migration;
   } catch (error) {
     if (!verified) {
@@ -89,18 +95,31 @@ async function encryptLegacyDatabase({ db, filePath, dek, oldKey = null, session
               path.join(sessionsRoot, accountId),
               newMasterKey,
               oldKey,
-              accountId
+              accountId,
+              { root: sessionsRoot }
             );
           } catch (rollbackError) {
-            console.error('Failed to roll back a migrated session folder.');
+            rollbackFailures.push({ accountId, error: rollbackError });
           }
         }
       }
-      db.data = snapshot;
-      db.mode = previousMode;
+      db.data = structuredClone(snapshot);
+      for (const failure of rollbackFailures) {
+        const account = (db.data.accounts || []).find((item) => item.id === failure.accountId);
+        if (account) {
+          account.needsRelink = true;
+          account.lastError = 'Re-link this account once; its session could not be restored after migration failure.';
+        }
+      }
+      db.mode = encryptedOnDisk ? 'locked' : previousMode;
       if (previousKey) previousKey.fill(0);
       db.encryptionKey = null;
       db.rebuildContactIndex();
+    }
+    if (rollbackFailures.length) {
+      const accounts = rollbackFailures.map((failure) => failure.accountId).join(', ');
+      error.message = `${error.message} Session rollback also failed for: ${accounts}.`;
+      error.rollbackFailures = rollbackFailures;
     }
     throw error;
   } finally {

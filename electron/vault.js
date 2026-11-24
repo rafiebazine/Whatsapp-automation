@@ -139,9 +139,12 @@ function validateVault(state) {
 class AuthVault {
   constructor(filePath, options = {}) {
     this.filePath = filePath;
+    this.fsOptions = { root: options.root ? path.resolve(options.root) : path.dirname(filePath) };
     this.scryptN = Number(options.scryptN) || DEFAULT_SCRYPT.N;
     this.bcryptRounds = Number(options.bcryptRounds) || DEFAULT_BCRYPT_ROUNDS;
-    this.writeFile = options.writeFile || ((file, data) => writeFileAtomicPrivate(file, data));
+    this.writeFile = options.writeFile ||
+      ((file, data, encoding = 'utf8', ioOptions = {}) =>
+        writeFileAtomicPrivate(file, data, encoding, { ...this.fsOptions, ...ioOptions }));
     this.state = null;
     this.dek = null;
   }
@@ -163,7 +166,10 @@ class AuthVault {
     }
     let parsed;
     try {
-      parsed = JSON.parse(readFilePrivate(this.filePath, 'utf8', { maxBytes: 1024 * 1024 }));
+      parsed = JSON.parse(readFilePrivate(this.filePath, 'utf8', {
+        ...this.fsOptions,
+        maxBytes: 1024 * 1024
+      }));
     } catch (error) {
       if (error && error.code === 'vault_corrupt') throw error;
       throw vaultError('vault_corrupt', 'The local security file could not be read.');
@@ -442,7 +448,7 @@ class AuthVault {
   }
 
   write() {
-    ensurePrivateDir(path.dirname(this.filePath));
+    ensurePrivateDir(path.dirname(this.filePath), this.fsOptions);
     this.persistState(this.state);
   }
 

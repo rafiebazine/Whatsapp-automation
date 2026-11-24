@@ -14,7 +14,8 @@ const {
 } = require('./identity');
 
 const ACTIVE_STATUSES = new Set(['queued', 'running']);
-const FINISHED_TARGET = new Set(['success', 'failed', 'skipped']);
+const FINISHED_TARGET = new Set(['success', 'failed', 'skipped', 'uncertain']);
+const UNCERTAIN_TARGET_ERROR = 'Action outcome could not be confirmed; review it before retrying.';
 
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
@@ -162,19 +163,31 @@ class QueueManager extends EventEmitter {
     let changed = false;
     for (const job of this.db.data.jobs) {
       if (!ACTIVE_STATUSES.has(job.status)) continue;
+      let jobChanged = false;
       for (const target of job.targets || []) {
         if (target.status === 'running') {
-          target.status = 'pending';
-          target.error = null;
-          changed = true;
+          target.status = 'uncertain';
+          target.error = target.error || UNCERTAIN_TARGET_ERROR;
+          jobChanged = true;
         }
       }
       if (job.status === 'running') {
-        job.status = 'queued';
+        job.status = 'needs-review';
+        jobChanged = true;
+      }
+      if (jobChanged) {
+        const group = typeof this.db.findGroup === 'function' ? this.db.findGroup(job.groupId) : null;
+        this.updateJobState(job, group);
         changed = true;
       }
     }
-    if (changed) this.saveBestEffort('queue-reset-interrupted');
+    if (changed) {
+      try {
+        this.saveOrThrow('queue-reset-interrupted');
+      } catch (error) {
+        this.pauseAfterPersistenceFailure(error, 'queue-reset-interrupted');
+      }
+    }
   }
 
   tickSoon(ms) {
@@ -423,7 +436,8 @@ class QueueManager extends EventEmitter {
       jobStartedAt: job.startedAt,
       jobBlockedReason: job.blockedReason
     };
-    target.status = 'running';
+    target.status = 'uncertain';
+    target.error = UNCERTAIN_TARGET_ERROR;
     target.attempts = (target.attempts || 0) + 1;
     job.status = 'running';
     if (!job.startedAt) job.startedAt = new Date().toISOString();
@@ -451,10 +465,9 @@ class QueueManager extends EventEmitter {
         [target],
         job.type === 'add' ? 'add' : 'remove'
       );
-      if (!Array.isArray(results) || results.length === 0) {
-        throw new Error('WhatsApp returned no confirmation for this action.');
-      }
-      const outcome = this.classifyResult(results[0], job.type);
+      const outcome = Array.isArray(results) && results.length > 0
+        ? this.classifyResult(results[0], job.type)
+        : { status: 'uncertain', error: UNCERTAIN_TARGET_ERROR };
       target.status = outcome.status;
       target.error = outcome.error;
       target.accountId = account.id;
@@ -511,10 +524,9 @@ class QueueManager extends EventEmitter {
         account.lastActionAt = Date.now();
         account.lastActiveAt = new Date().toISOString();
         account.consecutiveFailures = (account.consecutiveFailures || 0) + 1;
-        const canRetry = this.isRetryableError(error) && target.attempts < 3;
-        if (canRetry) {
-          target.status = 'pending';
-          target.error = message;
+        if (this.isRetryableError(error)) {
+          target.status = 'uncertain';
+          target.error = UNCERTAIN_TARGET_ERROR;
           target.accountId = account.id;
         } else {
           target.status = 'failed';
@@ -556,6 +568,9 @@ class QueueManager extends EventEmitter {
     try {
       this.saveOrThrow();
     } catch (error) {
+      target.status = 'uncertain';
+      target.error = UNCERTAIN_TARGET_ERROR;
+      target.processedAt = new Date().toISOString();
       this.pauseAfterPersistenceFailure(error, 'queue-execute-result');
       throw error;
     }
@@ -568,35 +583,40 @@ class QueueManager extends EventEmitter {
 
   updateJobState(job, group) {
     const targets = job.targets || [];
+    const uncertainCount = targets.filter((target) => target.status === 'uncertain').length;
     job.progress = {
       processed: targets.filter((target) => FINISHED_TARGET.has(target.status)).length,
       total: targets.length
     };
     job.errors = targets
-      .filter((target) => target.status === 'failed' || target.protected)
+      .filter((target) => target.status === 'failed' || target.status === 'uncertain' || target.protected)
       .map((target) => ({
         number: target.displayName || target.name || target.number,
         name: target.displayName || target.name || '',
         phoneNumber: target.phoneNumber || '',
         error: target.error || 'Unknown error',
         accountId: target.accountId || null,
-        protected: Boolean(target.protected)
+        protected: Boolean(target.protected),
+        uncertain: target.status === 'uncertain'
       }));
     job.successCount = targets.filter((target) => target.status === 'success').length;
     job.failedCount = targets.filter((target) => target.status === 'failed').length;
     job.skippedCount = targets.filter((target) => target.status === 'skipped').length;
+    job.uncertainCount = uncertainCount;
     job.blockedCount = targets.filter((target) => target.protected).length;
     const pending = targets.filter((target) => target.status === 'pending' || target.status === 'running').length;
     if (pending === 0) {
       const failed = job.failedCount;
       const done = job.successCount + job.skippedCount;
-      job.status = failed === 0 ? 'completed' : done === 0 ? 'failed' : 'partial';
+      job.status = uncertainCount > 0
+        ? 'needs-review'
+        : failed === 0 ? 'completed' : done === 0 ? 'failed' : 'partial';
       job.completedAt = new Date().toISOString();
       if (group) {
         group.hasOngoingAction = this.db.data.jobs.some(
           (item) => item.groupId === group.id && ACTIVE_STATUSES.has(item.status)
         );
-        group.hasError = failed > 0;
+        group.hasError = failed > 0 || uncertainCount > 0;
       }
     } else {
       job.status = 'running';
@@ -611,7 +631,9 @@ class QueueManager extends EventEmitter {
         (item) => item.groupId === group.id && ACTIVE_STATUSES.has(item.status)
       );
       if (!group.hasOngoingAction) {
-        group.hasError = job.status === 'failed' || job.status === 'partial';
+        group.hasError = job.status === 'failed'
+          || job.status === 'partial'
+          || job.status === 'needs-review';
       }
       this.saveBestEffort('queue-finalize');
       this.emit('groups:update');
@@ -622,6 +644,11 @@ class QueueManager extends EventEmitter {
         this.emit('toast', {
           type: 'success',
           message: `${job.type === 'add' ? 'Adding members to' : 'Removing members from'} ${job.groupName} finished.`
+        });
+      } else if (job.status === 'needs-review') {
+        this.emit('toast', {
+          type: 'error',
+          message: `${job.type === 'add' ? 'Adding members to' : 'Removing members from'} ${job.groupName} finished with actions needing review.`
         });
       } else {
         this.emit('toast', {
@@ -659,10 +686,9 @@ class QueueManager extends EventEmitter {
     const memberKeys = memberKeysFor(group);
     const pendingTargets = new Set();
     for (const job of this.db.data.jobs) {
-      if (job.groupId !== groupId || job.type !== type) continue;
-      if (!ACTIVE_STATUSES.has(job.status)) continue;
+      if (job.groupId !== groupId || job.type !== type || job.dismissed) continue;
       for (const target of job.targets || []) {
-        if (target.status === 'pending' || target.status === 'running') {
+        if (target.status === 'pending' || target.status === 'running' || target.status === 'uncertain') {
           const key = targetKey(target);
           if (key) pendingTargets.add(key);
         }
@@ -783,30 +809,24 @@ class QueueManager extends EventEmitter {
     const jobs = this.db.data.jobs.filter(
       (job) => job.groupId === groupId && ACTIVE_STATUSES.has(job.status)
     );
+    const groupForState = this.db.findGroup(groupId);
     for (const job of jobs) {
       for (const target of job.targets || []) {
-        if (target.status === 'pending' || target.status === 'running') {
+        if (target.status === 'pending') {
           target.status = 'failed';
           target.error = reason;
           target.processedAt = new Date().toISOString();
+        } else if (target.status === 'running') {
+          target.status = 'uncertain';
+          target.error = UNCERTAIN_TARGET_ERROR;
+          target.processedAt = new Date().toISOString();
         }
       }
-      job.status = 'failed';
-      job.completedAt = new Date().toISOString();
       job.blockedReason = null;
-      job.errors = (job.targets || [])
-        .filter((target) => target.status === 'failed')
-        .map((target) => ({
-          number: target.displayName || target.name || target.number,
-          name: target.displayName || target.name || '',
-          phoneNumber: target.phoneNumber || '',
-          error: target.error || reason,
-          accountId: target.accountId || null
-        }));
-      job.progress = { processed: (job.targets || []).length, total: (job.targets || []).length };
+      this.updateJobState(job, groupForState);
     }
     if (jobs.length) {
-      const group = this.db.findGroup(groupId);
+      const group = groupForState;
       if (group) {
         group.hasOngoingAction = this.db.data.jobs.some(
           (item) => item.groupId === groupId && ACTIVE_STATUSES.has(item.status)
@@ -820,6 +840,46 @@ class QueueManager extends EventEmitter {
       }
     }
     return jobs.length;
+  }
+
+  async reviewUncertainJob(jobId) {
+    const job = this.db.findJob(jobId);
+    if (!job) throw new Error('Job not found.');
+    if (job.status !== 'needs-review') throw new Error('Only jobs needing review can be verified.');
+    const group = this.db.findGroup(job.groupId);
+    if (!group) throw new Error('Group not found.');
+    await this.sessions.refreshGroup(group.id, { strict: true });
+    const freshGroup = this.db.findGroup(group.id) || group;
+    const memberKeys = memberKeysFor(freshGroup);
+    const updates = [];
+    (job.targets || []).forEach((target, index) => {
+      if (target.status !== 'uncertain') return;
+      const key = targetKey(target);
+      if (job.type === 'add' && memberKeys.has(key)) {
+        updates.push({ index, status: 'skipped', error: 'Already in the group (verified).' });
+      } else if (job.type === 'remove' && !memberKeys.has(key)) {
+        updates.push({ index, status: 'skipped', error: 'No longer in the group (verified).' });
+      } else {
+        updates.push({ index, status: 'uncertain', error: 'Outcome still unknown. It was not retried automatically.' });
+      }
+    });
+    if (updates.length === 0) return 0;
+    this.transaction((data) => {
+      const targetJob = data.jobs.find((item) => item.id === job.id);
+      if (!targetJob) return;
+      for (const update of updates) {
+        const target = (targetJob.targets || [])[update.index];
+        if (!target) continue;
+        target.status = update.status;
+        target.error = update.error;
+        if (update.status === 'skipped') target.processedAt = new Date().toISOString();
+      }
+      this.updateJobState(targetJob, freshGroup);
+    }, 'queue-review-uncertain');
+    this.emitJobs();
+    this.emit('groups:update');
+    this.kick();
+    return updates.filter((update) => update.status === 'skipped').length;
   }
 
   emitJobs() {

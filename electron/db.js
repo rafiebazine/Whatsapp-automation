@@ -142,9 +142,15 @@ function decryptDatabase(envelope, key) {
 class Database {
   constructor(filePath, options = {}) {
     this.filePath = filePath;
+    this.fsOptions = { root: options.root ? path.resolve(options.root) : path.dirname(filePath) };
     this.io = {
-      ensurePrivateDir: options.ensurePrivateDir || ensurePrivateDir,
-      writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate,
+      ensurePrivateDir: (dir, ioOptions = {}) =>
+        (options.ensurePrivateDir || ensurePrivateDir)(dir, { ...this.fsOptions, ...ioOptions }),
+      writeFileAtomicPrivate: (target, data, encoding = 'utf8', ioOptions = {}) =>
+        (options.writeFileAtomicPrivate || writeFileAtomicPrivate)(target, data, encoding, {
+          ...this.fsOptions,
+          ...ioOptions
+        }),
       readFileSync: options.readFileSync || fs.readFileSync
     };
     this.persistenceErrorHandler = options.onPersistenceError || null;

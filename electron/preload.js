@@ -21,6 +21,7 @@ const INVOKE_CHANNELS = new Set([
   'jobs:create',
   'jobs:list',
   'jobs:dismiss',
+  'jobs:verify-uncertain',
   'contacts:list',
   'contacts:refresh',
   'contacts:import',

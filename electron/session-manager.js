@@ -459,7 +459,9 @@ class SessionManager extends EventEmitter {
     const folder = accountSessionFolder(this.sessionsRoot, account);
     let authState;
     try {
-      authState = await this.createAuthState(folder, this.masterKey, account.id);
+      authState = await this.createAuthState(folder, this.masterKey, account.id, {
+        root: this.sessionsRoot
+      });
     } catch (error) {
       account.status = 'disconnected';
       account.needsRelink = true;

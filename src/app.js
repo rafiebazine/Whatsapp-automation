@@ -204,7 +204,8 @@ function jobStatusMeta(status) {
     running: { label: 'Running', tone: 'green' },
     completed: { label: 'Completed', tone: 'green' },
     failed: { label: 'Failed', tone: 'red' },
-    partial: { label: 'Partial', tone: 'amber' }
+    partial: { label: 'Partial', tone: 'amber' },
+    'needs-review': { label: 'Needs review', tone: 'amber' }
   };
   return map[status] || { label: status, tone: 'gray' };
 }
@@ -350,6 +351,18 @@ function bindJobActions(scope = document) {
       }
     });
   });
+  scope.querySelectorAll('[data-job-verify]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const jobId = button.getAttribute('data-job-verify');
+      if (!window.confirm('Refresh this group and verify uncertain actions? Nothing will be sent again automatically.')) return;
+      button.disabled = true;
+      try {
+        await call('jobs:verify-uncertain', [jobId]);
+      } catch (error) {
+        button.disabled = false;
+      }
+    });
+  });
   scope.querySelectorAll('[data-job-errors]').forEach((button) => {
     button.addEventListener('click', () => {
       const jobId = button.getAttribute('data-job-errors');
@@ -370,9 +383,11 @@ function jobCard(job) {
     ? job.blockedReason
       ? `<span class="blocked">${esc(job.blockedReason)}</span>`
       : `<span>~${formatDuration(remaining)} remaining</span>`
-    : job.status === 'completed'
-      ? `<span>Finished ${formatRelative(job.completedAt)}</span>`
-      : `<span>${job.failedCount || 0} failed · ${job.skippedCount || 0} skipped</span>`;
+    : job.status === 'needs-review'
+      ? `<span>${job.uncertainCount || 0} need review · not retried automatically</span>`
+      : job.status === 'completed'
+        ? `<span>Finished ${formatRelative(job.completedAt)}</span>`
+        : `<span>${job.failedCount || 0} failed · ${job.skippedCount || 0} skipped</span>`;
   return `
     <div class="job-card ${job.status}">
       <div class="job-top">
@@ -388,6 +403,9 @@ function jobCard(job) {
         <div class="job-errors">
           ${job.errors && job.errors.length ? `<button class="btn btn-ghost" data-job-errors="${esc(job.id)}">${icon('alert', 14)} View ${job.errors.length} error${job.errors.length === 1 ? '' : 's'}</button>` : ''}
         </div>
+        ${job.status === 'needs-review'
+          ? `<button class="btn btn-ghost" data-job-verify="${esc(job.id)}">Verify uncertain</button>`
+          : ''}
         ${!active ? `<button class="btn btn-close" data-job-dismiss="${esc(job.id)}">${icon('x', 13)} Close</button>` : ''}
       </div>
     </div>`;

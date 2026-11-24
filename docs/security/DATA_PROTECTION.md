@@ -26,9 +26,17 @@ A fresh app start does not create a plaintext database. Until setup succeeds, th
 5. An encrypted `.migrated-*.enc` copy is written after the new database is verified.
 6. Accounts that fail re-encryption are marked `needsRelink`; the app does not silently discard them.
 
-A failed migration leaves the plaintext database and the new vault in place so the operator can retry. If session re-encryption already occurred, the migration attempts to re-encrypt those session folders back to the old key before restoring the in-memory database snapshot. There is no plaintext migration backup.
+A failed migration before the encrypted database write leaves the plaintext database and the new vault in place so the operator can retry. If the encrypted database was already written but verification fails, session folders are re-encrypted back to the old key where possible, accounts with rollback failures are marked `needsRelink`, and the database is left locked rather than restored to plaintext mode. There is no plaintext migration backup.
 
-Database, vault, and auth-state writes are transactional at the application level. A write failure does not silently report success: transactions restore in-memory state, queue execution persists `running` state before sending, and credential-write failure marks the account `needsRelink` and closes its socket. Atomic writes use a private temporary file and rename; a failed rename removes the temporary file and preserves the previous file.
+Database, vault, and auth-state writes are transactional at the application level. A write failure does not silently report success: transactions restore in-memory state, queue execution persists an `uncertain` target before sending, and credential-write failure marks the account `needsRelink` and closes its socket. Atomic writes use a private temporary file and rename; a failed rename removes the temporary file and preserves the previous file. If post-rename verification or sync fails, the previous file content is restored before the error is returned.
+
+## Temporary files and paths
+
+- Sensitive paths are resolved against an explicit root. Component-wise `lstat` checks reject symlinks and Windows junctions before create, read, rename, or replace.
+- Temp files are created in the destination directory with exclusive `wx` creation. On POSIX they are `0600`; on Windows they receive restrictive ACLs before any payload bytes are written.
+- Directory and file fsync errors are reported except on filesystems that do not support directory fsync (`EINVAL`, `ENOSYS`, `ENOTSUP`). Checksums are integrity checks only and are not authenticity guarantees.
+- Structurally invalid encrypted auth state fails closed as `auth_corrupt` instead of being silently replaced with fresh credentials.
+- An already-sent WhatsApp action that cannot be definitively confirmed remains `uncertain` on disk, is never auto-retried, and can only be resolved through explicit manual verification after a fresh group refresh.
 
 ## Backup and restore
 

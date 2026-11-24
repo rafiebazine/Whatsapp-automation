@@ -15,6 +15,7 @@ const ENABLED = process.env.WGM_DIAGNOSTIC_CONTACTS === '1';
 const FULL = ENABLED && process.env.WGM_DIAGNOSTIC_CONTACTS_FULL === '1';
 const RAW_IDS = ENABLED && process.env.WGM_DIAGNOSTIC_CONTACTS_RAW_IDS === '1';
 let REPORT_PATH = process.env.WGM_DIAGNOSTIC_REPORT || '';
+let REPORT_ROOT = '';
 const SAMPLE_LIMIT = FULL ? Number.POSITIVE_INFINITY : 20;
 const STARTED_AT = new Date().toISOString();
 
@@ -531,9 +532,11 @@ function buildReport() {
 function configure(dataDir) {
   if (process.env.WGM_DIAGNOSTIC_REPORT) {
     REPORT_PATH = process.env.WGM_DIAGNOSTIC_REPORT;
+    REPORT_ROOT = path.dirname(REPORT_PATH);
     return;
   }
   if (!dataDir) return;
+  REPORT_ROOT = dataDir;
   REPORT_PATH = path.join(dataDir, 'diagnostics', 'contact-diagnostics.json');
 }
 
@@ -541,8 +544,9 @@ function writeReport() {
   if (!ENABLED || !REPORT_PATH) return null;
   const report = buildReport();
   try {
-    ensurePrivateDir(path.dirname(REPORT_PATH));
-    writeFileAtomicPrivate(REPORT_PATH, JSON.stringify(report, null, 2));
+    const fsOptions = { root: REPORT_ROOT || path.dirname(REPORT_PATH) };
+    ensurePrivateDir(path.dirname(REPORT_PATH), fsOptions);
+    writeFileAtomicPrivate(REPORT_PATH, JSON.stringify(report, null, 2), 'utf8', fsOptions);
   } catch (error) {
     console.error('[CONTACT DIAGNOSTICS] Failed to write report:', error.message);
   }

@@ -46,9 +46,12 @@ function authKey(masterKey, accountId) {
   );
 }
 
-async function readAuthState(file, masterKey, accountId, bufferJson) {
+async function readAuthState(file, masterKey, accountId, bufferJson, options = {}) {
   if (!fs.existsSync(file)) return null;
-  const raw = secureFs.readFilePrivate(file, 'utf8', { maxBytes: 16 * 1024 * 1024 });
+  const raw = secureFs.readFilePrivate(file, 'utf8', {
+    root: options.root || path.dirname(file),
+    maxBytes: 16 * 1024 * 1024
+  });
   const payload = JSON.parse(raw);
   return decryptJson(payload, authKey(masterKey, accountId), bufferJson, accountId);
 }
@@ -73,9 +76,15 @@ function persistenceFailure(cause) {
 }
 
 async function useEncryptedAuthState(folder, masterKey, accountId, options = {}) {
+  const fsOptions = { root: options.root ? path.resolve(options.root) : path.dirname(folder) };
   const io = {
-    ensurePrivateDir: options.ensurePrivateDir || ensurePrivateDir,
-    writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate,
+    ensurePrivateDir: (target, ioOptions = {}) =>
+      (options.ensurePrivateDir || ensurePrivateDir)(target, { ...fsOptions, ...ioOptions }),
+    writeFileAtomicPrivate: (target, data, encoding = 'utf8', ioOptions = {}) =>
+      (options.writeFileAtomicPrivate || writeFileAtomicPrivate)(target, data, encoding, {
+        ...fsOptions,
+        ...ioOptions
+      }),
     loadBaileys: options.loadBaileys || loadBaileys,
     encryptJson: options.encryptJson || encryptJson,
     retries: Number.isInteger(options.retries) ? options.retries : 3,
@@ -88,9 +97,14 @@ async function useEncryptedAuthState(folder, masterKey, accountId, options = {})
 
   let state = null;
   if (fs.existsSync(file)) {
-    state = await readAuthState(file, masterKey, accountId, BufferJSON);
+    state = await readAuthState(file, masterKey, accountId, BufferJSON, fsOptions);
+    if (!state || !state.creds || !state.keys) {
+      const error = new Error('The encrypted session state is missing required fields.');
+      error.code = 'auth_corrupt';
+      throw error;
+    }
   }
-  if (!state || !state.creds || !state.keys) {
+  if (!state) {
     state = { creds: initAuthCreds(), keys: {} };
   }
 
@@ -154,14 +168,19 @@ async function useEncryptedAuthState(folder, masterKey, accountId, options = {})
 }
 
 async function migrateEncryptedAuthState(folder, oldMasterKey, newMasterKey, accountId, options = {}) {
+  const fsOptions = { root: options.root ? path.resolve(options.root) : path.dirname(folder) };
   const io = {
     loadBaileys: options.loadBaileys || loadBaileys,
-    writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate
+    writeFileAtomicPrivate: (target, data, encoding = 'utf8', ioOptions = {}) =>
+      (options.writeFileAtomicPrivate || writeFileAtomicPrivate)(target, data, encoding, {
+        ...fsOptions,
+        ...ioOptions
+      })
   };
   const file = path.join(folder, 'auth.enc');
   if (!fs.existsSync(file)) return false;
   const { BufferJSON } = await io.loadBaileys();
-  const state = await readAuthState(file, oldMasterKey, accountId, BufferJSON);
+  const state = await readAuthState(file, oldMasterKey, accountId, BufferJSON, fsOptions);
   if (!state) return false;
   const key = authKey(newMasterKey, accountId);
   try {

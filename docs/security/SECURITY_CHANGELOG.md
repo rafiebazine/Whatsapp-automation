@@ -1,5 +1,17 @@
 # Security Changelog — Phase 2
 
+## Linux/Windows first-class remediation
+
+- Replaced substring ACL checks with strict `icacls` parsing and an exact allowed-principal set built from `whoami /user`, `SYSTEM`, and `Administrators`. Inherited, deny, unknown, empty, unparsable, and unexpected ACL entries fail closed.
+- Hardened every sensitive temp file before payload writes, verified restrictive ACLs after atomic rename, added component-wise symlink/root checks, and removed ACL caching.
+- Atomic writes now restore previous file content when post-rename verification or directory sync fails; real directory-fsync errors are reported instead of swallowed.
+- Added explicit secure-fs roots across database, vault, session, migration, and diagnostics callers. Structurally invalid encrypted auth state now fails closed as `auth_corrupt`.
+- Legacy migration locks the database instead of restoring plaintext mode when encrypted bytes were already written, marks rollback-failed sessions `needsRelink`, and reports rollback failures.
+- Queue execution now persists an `uncertain` target before sending. Interrupted, ambiguous, unconfirmed, and post-send-persistence-failure outcomes become `uncertain`/`needs-review`, are excluded from scheduling and duplicate jobs, and can only be resolved by explicit manual verification after a fresh group refresh.
+- Added renderer status metadata and a recent-auth `jobs:verify-uncertain` IPC channel for manual verification without resending.
+- Expanded Linux, fake-Windows, native-Windows, persistence, restart, and duplicate-action regression tests. Full Linux suite: 168 passing; security suite: 68 passing.
+- Security CI now builds and verifies artifacts on both Ubuntu and Windows in addition to audit and tests.
+
 ## Correctness remediation (audit of `995acf9`)
 
 - Auth-state persistence now rejects on failure, serializes writes, retries transient file errors, marks the account `needsRelink`, and closes the socket on terminal credential-write failure. Database-only identity failures are reported without forcing a relink.

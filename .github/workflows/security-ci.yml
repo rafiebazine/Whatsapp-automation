@@ -32,3 +32,45 @@ jobs:
         run: npm run test:security
       - name: Report signing configuration
         run: npm run signing:status
+
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            command: npm run build:linux
+          - os: windows-latest
+            command: npm run build:win
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build artifacts
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: ${{ matrix.command }}
+      - name: Verify artifacts
+        shell: bash
+        run: npm run verify:artifacts
+      - name: Generate checksums
+        shell: bash
+        run: npm run checksums
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-build-${{ matrix.os }}
+          path: |
+            dist/*.exe
+            dist/*.AppImage
+            dist/*.sha256
+            dist/*.blockmap
+            dist/*.yml
+          if-no-files-found: error
