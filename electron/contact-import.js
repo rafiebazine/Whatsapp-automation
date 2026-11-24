@@ -8,6 +8,23 @@ const {
   sanitizeContactName
 } = require('./identity');
 
+const MAX_ROW_KEYS = 10;
+const MAX_FIELD_CHARS = 1000;
+
+function invalidImportRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return true;
+  const keys = Object.keys(row);
+  if (keys.length > MAX_ROW_KEYS) return true;
+  for (const key of keys) {
+    const value = row[key];
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string' && value.length > MAX_FIELD_CHARS) return true;
+    if (typeof value === 'object' || typeof value === 'function') return true;
+    if (typeof value === 'number' && !Number.isFinite(value)) return true;
+  }
+  return false;
+}
+
 function normalizeImportRow(row) {
   if (!row || typeof row !== 'object') return null;
   const rawJid = normalizeJid(row.jid || '');
@@ -54,6 +71,10 @@ function importContacts(db, rows) {
   };
 
   for (const row of list) {
+    if (invalidImportRow(row)) {
+      result.skipped += 1;
+      continue;
+    }
     const normalized = normalizeImportRow(row);
     if (!normalized) {
       result.skipped += 1;

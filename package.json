@@ -11,23 +11,28 @@
     "dev": "electron . --dev",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "build:linux": "electron-builder --linux AppImage",
+    "dist:linux": "electron-builder --linux AppImage",
+    "checksums": "node scripts/checksums.js",
+    "signing:status": "node scripts/signing-status.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.24",
     "bcryptjs": "^2.4.3",
     "pino": "^9.5.0",
     "qrcode": "^1.5.4",
-    "xlsx": "^0.18.5"
+    "xlsx": "file:vendor/xlsx-0.20.3.tgz"
   },
   "devDependencies": {
-    "electron": "^33.2.0",
-    "electron-builder": "^25.1.8"
+    "@electron/fuses": "2.1.3",
+    "electron": "45.4.1",
+    "electron-builder": "26.18.0"
   },
   "build": {
     "appId": "com.whatsapp.groupmanager",
     "productName": "WhatsApp Group Manager",
-    "asar": false,
+    "asar": true,
     "directories": {
       "output": "dist"
     },
@@ -55,6 +60,22 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
+    },
+    "afterPack": "scripts/after-pack.js",
+    "afterAllArtifactBuild": "scripts/after-all-artifact-build.js",
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
     }
+  },
+  "overrides": {
+    "minimatch@9.0.9": "11.0.1",
+    "minimatch@10.2.6": "11.0.1"
   }
 }

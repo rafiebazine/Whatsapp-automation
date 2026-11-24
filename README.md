@@ -15,7 +15,7 @@ npm install
 npm start
 ```
 
-On first launch, create a local username and password. This login stays on the computer and is required every time the app opens.
+On first launch, create a local username and a password of at least 12 characters. The app shows a one-time recovery key; store it offline. The login and recovery key are local to this computer.
 
 ## Build the Windows installer
 
@@ -33,10 +33,13 @@ Output is written to `dist/`:
 ## Build the Linux AppImage
 
 ```bash
-npx electron-builder --linux AppImage
+npm run dist:linux
+npm run checksums
 ```
 
-Output: `dist/WhatsApp Group Manager-1.0.0.AppImage`.
+Output: `dist/WhatsApp Group Manager-1.0.0.AppImage` plus a `.sha256` sidecar. Verify it with `sha256sum -c "dist/WhatsApp Group Manager-1.0.0.AppImage.sha256"`.
+
+Release artifacts are currently unsigned. Code-signing certificates are not configured, so Windows SmartScreen and Linux distribution warnings may appear. Compare checksums against the source you built from.
 
 If the AppImage is launched directly from a terminal on a Linux system that blocks Electron's SUID sandbox helper, start it with `--no-sandbox` or use the generated desktop entry:
 
@@ -67,22 +70,27 @@ All of these can be changed in **Settings**. Account rotation always prefers the
 
 ## Local data and security
 
-The app stores its database and encrypted WhatsApp sessions in Electron's user-data folder. The exact path is shown in **Settings → Local data**.
+The app stores its encrypted database, local security vault, and encrypted WhatsApp sessions in Electron's user-data folder. The exact path is shown in **Settings → Local data**.
 
-- Database: `whatsapp-group-manager.json`
-- Sessions: `sessions/` — each account's Baileys auth state is stored as AES-256-GCM encrypted `auth.enc`
-- The encryption key is derived from the local login password with scrypt and HKDF
-- Passwords are stored as bcrypt hashes
+- Database: `whatsapp-group-manager.json`, encrypted with AES-256-GCM under a random 256-bit key
+- Vault: `auth-vault.json`, stores bcrypt password verifier and scrypt-wrapped copies of the database key for the password and recovery key
+- Sessions: `sessions/<account-id>/auth.enc`, AES-256-GCM encrypted with a random per-installation session key stored inside the encrypted database
+- Backups: `whatsapp-group-manager.json.migrated-*.enc` are encrypted migration backups
+- Passwords are stored as bcrypt hashes; recovery keys are shown once and stored only as key-wrap material
 
-The password cannot be recovered. Reset the login only by clearing the app data folder described below; existing encrypted sessions will become unusable and the accounts must be re-linked.
+The app auto-locks after 15 idle minutes by default (configurable from 1 to 240 minutes in Settings). Locking pauses the queue, waits briefly for in-flight work, stops WhatsApp sockets, and clears keys from memory. Use **Lock now** in Settings or quit the app to close access.
+
+Forgot your password? Choose **Use recovery key** on the login screen. A successful reset issues a new recovery key and invalidates the old one. If both the password and recovery key are lost, the encrypted database and sessions cannot be recovered; re-link accounts after starting fresh.
 
 ## Reset the app
 
 1. Quit the app.
 2. Open the data folder shown in Settings.
-3. Delete the whole folder.
+3. Delete the whole folder, including `auth-vault.json`, the encrypted database, and `sessions/`.
 
-This removes the local login, encrypted sessions, tracked groups, contacts, and job history. It does **not** unlink accounts from WhatsApp unless you unlink them in the app first. If you only delete `whatsapp-group-manager.json`, the old session files remain orphaned and should be removed too.
+This removes the local login, encrypted sessions, tracked groups, contacts, and job history. It does **not** unlink accounts from WhatsApp unless you unlink them in the app first. Never keep an unencrypted copy of the database or session folder in a shared location.
+
+See `docs/security/` for the architecture, data-protection, configuration, changelog, and test evidence.
 
 ## Notes
 

@@ -4,6 +4,12 @@ const INVOKE_CHANNELS = new Set([
   'auth:status',
   'auth:setup',
   'auth:login',
+  'auth:loginRecovery',
+  'auth:resetWithRecovery',
+  'auth:reauth',
+  'auth:changePassword',
+  'auth:regenerateRecovery',
+  'auth:lock',
   'auth:logoutApp',
   'app:snapshot',
   'groups:fetchAvailable',
@@ -36,6 +42,7 @@ const EVENT_CHANNELS = new Set([
   'qr:update',
   'toast',
   'auth:changed',
+  'auth:idleWarning',
   'settings:update'
 ]);
 

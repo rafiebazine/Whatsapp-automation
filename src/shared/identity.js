@@ -308,7 +308,9 @@
   }
 
   function sanitizeContactName(value) {
-    return isUsableName(value) ? asText(value) : '';
+    const text = asText(value);
+    if (!text || text.length > 200 || /[\u0000-\u001f\u007f]/.test(text)) return '';
+    return isUsableName(text) ? text : '';
   }
 
   function getContactDisplayName(value, fallback = 'Unknown contact') {

@@ -20,11 +20,13 @@ The app is not a WhatsApp replacement. It is an unofficial automation tool built
 
 ### Local login
 
-The first time the app opens, you create a local username and password. This login protects the app on this computer and is used to derive the encryption key for WhatsApp session files.
+The first time the app opens, you create a local username and a password of at least 12 characters. The app encrypts local data with a random database key and wraps that key with your password and a one-time recovery key.
 
-- The password is not recoverable.
-- Logging out of the app does not unlink WhatsApp accounts.
-- Clearing the app data folder removes the local login and encrypted sessions. Linked accounts must then be linked again.
+- Store the recovery key offline; it is shown only once.
+- A successful recovery reset issues a new recovery key and invalidates the old one.
+- The app auto-locks after 15 idle minutes by default; the timeout is configurable from 1 to 240 minutes.
+- Locking pauses the queue, stops WhatsApp sockets, and clears keys from memory. Logging out does not unlink WhatsApp accounts.
+- Clearing the app data folder removes the local vault, encrypted database, and encrypted sessions. Linked accounts must then be linked again.
 
 ### Admin accounts
 
@@ -87,8 +89,8 @@ npm start
 
 ### First launch
 
-1. Create a local username and password.
-2. Sign in.
+1. Create a local username and a password of at least 12 characters.
+2. Save the recovery key shown once, then continue.
 3. Open **Settings**.
 4. Under **Admin accounts**, choose **Add new admin**.
 5. Enter an alias and scan the QR code from WhatsApp **Linked devices**.
@@ -154,6 +156,7 @@ Settings contains:
 - **Admin accounts** — add, relink, or unlink accounts.
 - **Rotation & pacing** — daily cap, batch size, delays, batch pauses, and quiet hours.
 - **Local data** — shows the local data folder path.
+- **Local security** — auto-lock timeout, lock now, change password, and regenerate the recovery key.
 
 Default pacing:
 
@@ -226,14 +229,17 @@ Steps:
 2. Start the app with `--no-sandbox`.
 3. Confirm the first-time setup screen appears.
 4. Enter a username shorter than 3 characters.
-5. Enter a password shorter than 6 characters.
+5. Enter a password shorter than 12 characters.
 6. Enter mismatched password confirmation.
 7. Enter valid credentials and create the login.
+8. Confirm the recovery-key dialog appears exactly once.
 
 Expected:
 
 - Invalid values show clear validation messages.
-- Valid values create the local login and open the home screen.
+- Valid values create the encrypted local database and open the home screen.
+- The recovery key is shown once and is not present anywhere in the renderer snapshot or logs.
+- No plaintext `whatsapp-group-manager.json` is created on a fresh install.
 - The home screen shows no accounts and no groups.
 - The app suggests linking the first admin account.
 
@@ -245,13 +251,16 @@ Steps:
 2. Enter an incorrect username or password.
 3. Enter the correct credentials.
 4. Log out again.
+5. Sign in again, then choose **Settings → Local security → Lock now**.
+6. Leave the app idle past the configured auto-lock timeout.
 
 Expected:
 
-- Incorrect credentials are rejected.
+- Incorrect credentials are rejected and repeated failures trigger an escalating delay.
 - Correct credentials open the app.
-- Logging out returns to the login screen.
-- WhatsApp accounts remain linked after app logout.
+- Logging out and locking both return to the login screen and clear keys from memory.
+- The queue stops and WhatsApp sockets disconnect while locked.
+- WhatsApp accounts remain linked after app logout or lock.
 
 #### T03 — Link an admin account
 
@@ -525,12 +534,15 @@ Steps:
 
 1. Back up the current data folder.
 2. Restore an older `whatsapp-group-manager.json` that contains phone-number-only members and jobs.
-3. Start the app and log in.
+3. Start the app and log in with the existing password, then choose a new password of at least 12 characters.
 4. Check groups, members, contacts, and jobs.
+5. Confirm `whatsapp-group-manager.json` is now encrypted and a `.migrated-*.enc` backup exists.
 
 Expected:
 
 - Existing accounts, groups, contacts, and jobs still load.
+- The legacy plaintext database is replaced by an encrypted envelope.
+- Legacy sessions are re-encrypted; any account that cannot be migrated is marked for relinking.
 - Existing job statuses are preserved.
 - Phone-number members receive a PN JID identity.
 - LID members without phone numbers are preserved.
@@ -555,6 +567,24 @@ Expected:
 - LID JIDs are sent as LID JIDs.
 - Phone recipients are converted to PN JIDs.
 - The app never treats a LID's digits as a phone number.
+
+#### T21 — Recovery key, password change, and auto-lock
+
+Steps:
+
+1. Sign in and choose **Settings → Local security → Change password**.
+2. Sign out, then use **Use recovery key** with the saved key and choose a new password.
+3. Save the newly displayed recovery key.
+4. Try the old recovery key.
+5. Change the auto-lock timeout to 1 minute and leave the app idle.
+
+Expected:
+
+- A password change requires the current password and signs other operations out at the next sensitive action.
+- Recovery reset rotates the recovery key and invalidates the old key.
+- Auto-lock triggers within roughly one minute plus the timer interval.
+- Auto-lock pauses the queue, disconnects sessions, and requires the new password to unlock.
+- No recovery key or password is written to logs.
 
 ### 5.5 Acceptance criteria
 

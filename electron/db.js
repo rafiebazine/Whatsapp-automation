@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { ensurePrivateDir, writeFileAtomicPrivate } = require('./secure-fs');
 const {
   normalizeJid,
   isPnJid,
@@ -15,6 +16,12 @@ const {
   sanitizeContactName,
   mergeContactRecords
 } = require('./identity');
+
+const DB_FORMAT = 'wgm-encrypted-db';
+const DB_VERSION = 2;
+const DB_AAD = Buffer.from('wgm-db-v2', 'utf8');
+const MAX_DB_BYTES = 256 * 1024 * 1024;
+const SAFE_ACCOUNT_ID = /^acc_[A-Za-z0-9-]{1,64}$/;
 
 const NAME_SOURCE_PRIORITY = {
   local: 5,
@@ -34,7 +41,8 @@ const DEFAULT_SETTINGS = {
   quietStart: '23:00',
   quietEnd: '07:00',
   failurePauseThreshold: 3,
-  maxAccounts: 4
+  maxAccounts: 4,
+  autoLockMinutes: 15
 };
 
 function defaultData() {
@@ -46,14 +54,96 @@ function defaultData() {
     groups: [],
     contacts: [],
     jobs: [],
-    logs: []
+    logs: [],
+    security: {
+      sessionMasterKey: ''
+    }
   };
+}
+
+function normalizeLoadedData(parsed) {
+  return migrateData({
+    ...defaultData(),
+    ...parsed,
+    settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) },
+    accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
+    groups: Array.isArray(parsed.groups) ? parsed.groups : [],
+    contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
+    jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
+    logs: Array.isArray(parsed.logs) ? parsed.logs : []
+  });
+}
+
+function validateEnvelope(envelope) {
+  if (!envelope || typeof envelope !== 'object') {
+    throw new Error('The encrypted database envelope is invalid.');
+  }
+  if (envelope.format !== DB_FORMAT || Number(envelope.version) !== DB_VERSION) {
+    throw new Error('The encrypted database envelope has an unsupported format or version.');
+  }
+  if (envelope.cipher !== 'aes-256-gcm') {
+    throw new Error('The encrypted database uses an unsupported cipher.');
+  }
+  if (typeof envelope.iv !== 'string' || typeof envelope.tag !== 'string' || typeof envelope.data !== 'string') {
+    throw new Error('The encrypted database envelope is incomplete.');
+  }
+  const iv = Buffer.from(envelope.iv, 'base64');
+  const tag = Buffer.from(envelope.tag, 'base64');
+  const data = Buffer.from(envelope.data, 'base64');
+  if (iv.length !== 12 || tag.length !== 16 || data.length === 0) {
+    throw new Error('The encrypted database envelope is malformed.');
+  }
+  return { iv, tag, data };
+}
+
+function encryptDatabase(data, key) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid database encryption key.');
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(DB_AAD);
+  const plaintext = Buffer.from(JSON.stringify(data, null, 2), 'utf8');
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return {
+    format: DB_FORMAT,
+    version: DB_VERSION,
+    cipher: 'aes-256-gcm',
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    data: encrypted.toString('base64')
+  };
+}
+
+function decryptDatabase(envelope, key) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid database encryption key.');
+  const { iv, tag, data } = validateEnvelope(envelope);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAAD(DB_AAD);
+  decipher.setAuthTag(tag);
+  let plaintext;
+  try {
+    plaintext = Buffer.concat([decipher.update(data), decipher.final()]).toString('utf8');
+  } catch (error) {
+    const failure = new Error('The encrypted database could not be opened with this key.');
+    failure.code = 'db_decrypt_failed';
+    throw failure;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(plaintext);
+  } catch (error) {
+    const failure = new Error('The decrypted database is not valid JSON.');
+    failure.code = 'db_corrupt';
+    throw failure;
+  }
+  return normalizeLoadedData(parsed);
 }
 
 class Database {
   constructor(filePath) {
     this.filePath = filePath;
     this.data = defaultData();
+    this.mode = 'locked';
+    this.encryptionKey = null;
     this.contactIndex = new Map();
     this.contactIndexPositions = new WeakMap();
     this.contactIndexReady = false;
@@ -68,27 +158,39 @@ class Database {
     };
   }
 
-  load() {
-    try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      if (fs.existsSync(this.filePath)) {
-        const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-        this.data = migrateData({
-          ...defaultData(),
-          ...parsed,
-          settings: { ...DEFAULT_SETTINGS, ...(parsed.settings || {}) },
-          accounts: Array.isArray(parsed.accounts) ? parsed.accounts : [],
-          groups: Array.isArray(parsed.groups) ? parsed.groups : [],
-          contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
-          jobs: Array.isArray(parsed.jobs) ? parsed.jobs : [],
-          logs: Array.isArray(parsed.logs) ? parsed.logs : []
-        });
-        this.save();
-      } else {
-        this.save();
+  inspect() {
+    ensurePrivateDir(path.dirname(this.filePath));
+    if (!fs.existsSync(this.filePath)) return { kind: 'missing' };
+    const stat = fs.statSync(this.filePath);
+    if (stat.size > MAX_DB_BYTES) throw new Error('The local database file is too large.');
+    const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+    if (parsed && parsed.format === DB_FORMAT) {
+      try {
+        validateEnvelope(parsed);
+      } catch (error) {
+        error.code = 'db_corrupt';
+        throw error;
       }
+      return { kind: 'encrypted', envelope: parsed };
+    }
+    return { kind: 'legacy', data: normalizeLoadedData(parsed) };
+  }
+
+  load() {
+    ensurePrivateDir(path.dirname(this.filePath));
+    if (!fs.existsSync(this.filePath)) {
+      this.data = defaultData();
+      this.mode = 'plaintext';
+      this.save();
+      this.rebuildContactIndex();
+      return this.data;
+    }
+    let info;
+    try {
+      info = this.inspect();
     } catch (error) {
       console.error('Failed to load local database:', error);
+      if (error.code === 'db_corrupt') throw error;
       try {
         if (fs.existsSync(this.filePath)) {
           const backup = `${this.filePath}.corrupt-${Date.now()}`;
@@ -99,21 +201,83 @@ class Database {
         console.error('Failed to preserve unreadable database:', backupError);
       }
       this.data = defaultData();
+      this.mode = 'plaintext';
       this.save();
+      this.rebuildContactIndex();
+      return this.data;
     }
+    if (info.kind === 'encrypted') {
+      throw new Error('The local database is encrypted. Unlock it with the local security vault.');
+    }
+    this.data = info.data;
+    this.mode = 'plaintext';
+    this.save();
     this.rebuildContactIndex();
     if (this.refreshCachedDisplayNames() > 0) this.save();
     return this.data;
   }
 
+  unlock(key) {
+    if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid database encryption key.');
+    const info = this.inspect();
+    if (info.kind !== 'encrypted') {
+      throw new Error('The local database is not encrypted.');
+    }
+    this.data = decryptDatabase(info.envelope, key);
+    this.encryptionKey = Buffer.from(key);
+    this.mode = 'encrypted';
+    this.ensureSessionMasterKey();
+    this.rebuildContactIndex();
+    if (this.refreshCachedDisplayNames() > 0) this.save();
+    return this.data;
+  }
+
+  useEncryptedData(data, key, options = {}) {
+    if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid database encryption key.');
+    this.data = normalizeLoadedData(data || {});
+    this.encryptionKey = Buffer.from(key);
+    this.mode = 'encrypted';
+    this.ensureSessionMasterKey();
+    this.rebuildContactIndex();
+    if (options.save !== false) this.save();
+    return this.data;
+  }
+
+  ensureSessionMasterKey() {
+    if (!this.data.security || typeof this.data.security !== 'object') this.data.security = {};
+    if (!this.data.security.sessionMasterKey) {
+      this.data.security.sessionMasterKey = crypto.randomBytes(32).toString('base64');
+      this.save();
+    }
+    return this.data.security.sessionMasterKey;
+  }
+
+  lock() {
+    if (this.encryptionKey) {
+      this.encryptionKey.fill(0);
+      this.encryptionKey = null;
+    }
+    this.mode = 'locked';
+    this.data = defaultData();
+    this.contactIndex = new Map();
+    this.contactIndexPositions = new WeakMap();
+    this.contactIndexReady = false;
+  }
+
   save() {
+    if (this.mode === 'locked') return false;
     try {
-      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(this.data, null, 2), 'utf8');
-      fs.renameSync(tmp, this.filePath);
+      ensurePrivateDir(path.dirname(this.filePath));
+      if (this.mode === 'encrypted') {
+        if (!this.encryptionKey) throw new Error('The database is unlocked without an encryption key.');
+        writeFileAtomicPrivate(this.filePath, JSON.stringify(encryptDatabase(this.data, this.encryptionKey), null, 2));
+      } else {
+        writeFileAtomicPrivate(this.filePath, JSON.stringify(this.data, null, 2));
+      }
+      return true;
     } catch (error) {
       console.error('Failed to save local database:', error);
+      return false;
     }
   }
 
@@ -483,6 +647,14 @@ function migrateAccount(account) {
   account.whatsappLid = normalizeJid(account.whatsappLid) || '';
   account.phoneNumber = phoneDigits(account.phoneNumber) || '';
   account.adminAccess = account.adminAccess && typeof account.adminAccess === 'object' ? account.adminAccess : {};
+  const accountId = String(account.id || '');
+  if (!account.authFolder) {
+    account.authFolder = accountId;
+  } else if (account.authFolder !== accountId || !SAFE_ACCOUNT_ID.test(String(account.authFolder))) {
+    account.authFolder = accountId;
+    account.needsRelink = true;
+    account.lastError = 'The stored session folder was reset for security. Re-link this account.';
+  }
 
   if (account.whatsappId) {
     if (!account.whatsappJid && account.whatsappId.endsWith('@s.whatsapp.net')) {
@@ -648,7 +820,17 @@ function migrateData(data) {
       targets: Array.isArray(job.targets) ? job.targets.map(migrateTarget) : []
     }))
     : [];
+  if (!data.security || typeof data.security !== 'object') data.security = { sessionMasterKey: '' };
+  if (typeof data.security.sessionMasterKey !== 'string') data.security.sessionMasterKey = '';
   return data;
 }
 
-module.exports = { Database, DEFAULT_SETTINGS, migrateData };
+module.exports = {
+  Database,
+  DEFAULT_SETTINGS,
+  migrateData,
+  encryptDatabase,
+  decryptDatabase,
+  DB_FORMAT,
+  DB_VERSION
+};

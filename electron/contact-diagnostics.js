@@ -9,12 +9,12 @@ const {
   isLidJid,
   sanitizeContactName
 } = require('./identity');
+const { ensurePrivateDir, writeFileAtomicPrivate } = require('./secure-fs');
 
 const ENABLED = process.env.WGM_DIAGNOSTIC_CONTACTS === '1';
 const FULL = ENABLED && process.env.WGM_DIAGNOSTIC_CONTACTS_FULL === '1';
 const RAW_IDS = ENABLED && process.env.WGM_DIAGNOSTIC_CONTACTS_RAW_IDS === '1';
-const REPORT_PATH = process.env.WGM_DIAGNOSTIC_REPORT
-  || path.join(os.tmpdir(), 'wgm-contact-diagnostics.json');
+let REPORT_PATH = process.env.WGM_DIAGNOSTIC_REPORT || '';
 const SAMPLE_LIMIT = FULL ? Number.POSITIVE_INFINITY : 20;
 const STARTED_AT = new Date().toISOString();
 
@@ -34,12 +34,21 @@ function redactIdentifier(value) {
   return hashIdentifier(text);
 }
 
+function redactName(value) {
+  const name = sanitizeContactName(value);
+  if (!name) return '';
+  return FULL ? name : `name:${hashIdentifier(name)}`;
+}
+
 function redactContact(contact) {
   if (!contact || typeof contact !== 'object') return contact;
-  if (RAW_IDS) return contact;
+  if (RAW_IDS && FULL) return contact;
   const copy = { ...contact };
   for (const key of ['id', 'jid', 'lid', 'phoneNumber', 'newJid', 'oldJid', 'pnJid', 'lidJid']) {
     if (copy[key]) copy[key] = redactIdentifier(copy[key]);
+  }
+  for (const key of ['name', 'notify', 'verifiedName', 'username', 'displayName', 'localName']) {
+    if (copy[key]) copy[key] = redactName(copy[key]);
   }
   return copy;
 }
@@ -55,11 +64,11 @@ function identityView(identity) {
 
 function nameFields(contact) {
   return {
-    name: sanitizeContactName(contact.name),
-    notify: sanitizeContactName(contact.notify),
-    verifiedName: sanitizeContactName(contact.verifiedName),
-    username: sanitizeContactName(contact.username),
-    displayName: sanitizeContactName(contact.displayName)
+    name: redactName(contact.name),
+    notify: redactName(contact.notify),
+    verifiedName: redactName(contact.verifiedName),
+    username: redactName(contact.username),
+    displayName: redactName(contact.displayName)
   };
 }
 
@@ -250,7 +259,7 @@ function recordContactBatch(source, contacts, db, event = source) {
   for (const contact of contacts) {
     const previousContact = db && typeof db.findContact === 'function' ? db.findContact(contact) : null;
     const previousName = previousContact && db && typeof db.contactName === 'function'
-      ? db.contactName(contact)
+      ? redactName(db.contactName(contact))
       : '';
     const observation = observeContact(source, contact, {
       name: previousName,
@@ -388,8 +397,8 @@ function recordMessages(accountId, payload, db) {
       participantLid: redactIdentifier(key.participantLid),
       senderPn: redactIdentifier(key.senderPn),
       senderLid: redactIdentifier(key.senderLid),
-      pushName,
-      verifiedBizName: sanitizeContactName(message.verifiedBizName),
+      pushName: redactName(pushName),
+      verifiedBizName: redactName(message.verifiedBizName),
       existed: Boolean(existing),
       currentName,
       persisted: Boolean(pushName && currentName === pushName)
@@ -399,11 +408,11 @@ function recordMessages(accountId, payload, db) {
 
 function recordWrite(details) {
   if (!ENABLED || !details) return;
-  const incoming = sanitizeContactName(details.incomingName);
-  const beforeName = sanitizeContactName(details.beforeName);
-  const beforeDisplay = sanitizeContactName(details.beforeDisplayName);
-  const afterName = sanitizeContactName(details.afterName);
-  const afterDisplay = sanitizeContactName(details.afterDisplayName);
+  const incoming = redactName(details.incomingName);
+  const beforeName = redactName(details.beforeName);
+  const beforeDisplay = redactName(details.beforeDisplayName);
+  const afterName = redactName(details.afterName);
+  const afterDisplay = redactName(details.afterDisplayName);
   const record = trackIdentity(details.identity);
   let outcome;
   if (!incoming) {
@@ -519,14 +528,21 @@ function buildReport() {
   };
 }
 
+function configure(dataDir) {
+  if (process.env.WGM_DIAGNOSTIC_REPORT) {
+    REPORT_PATH = process.env.WGM_DIAGNOSTIC_REPORT;
+    return;
+  }
+  if (!dataDir) return;
+  REPORT_PATH = path.join(dataDir, 'diagnostics', 'contact-diagnostics.json');
+}
+
 function writeReport() {
-  if (!ENABLED) return null;
+  if (!ENABLED || !REPORT_PATH) return null;
   const report = buildReport();
   try {
-    fs.mkdirSync(path.dirname(REPORT_PATH), { recursive: true });
-    const tempPath = `${REPORT_PATH}.${process.pid}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(report, null, 2), 'utf8');
-    fs.renameSync(tempPath, REPORT_PATH);
+    ensurePrivateDir(path.dirname(REPORT_PATH));
+    writeFileAtomicPrivate(REPORT_PATH, JSON.stringify(report, null, 2));
   } catch (error) {
     console.error('[CONTACT DIAGNOSTICS] Failed to write report:', error.message);
   }
@@ -573,9 +589,11 @@ module.exports = {
   recordWrite,
   buildReport,
   writeReport,
+  configure,
   resetForTests,
   _private: {
     redactIdentifier,
+    redactName,
     identityView,
     nameFields,
     messageIdentity

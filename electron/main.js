@@ -1,9 +1,15 @@
 const { app, BrowserWindow, ipcMain, Menu } = require('electron');
 const path = require('path');
+const { pathToFileURL, fileURLToPath } = require('url');
 const fs = require('fs');
-const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const { Database } = require('./db');
+const { AuthVault } = require('./vault');
+const { ensurePrivateDir } = require('./secure-fs');
+const {
+  deriveLegacyKey,
+  encryptLegacyDatabase
+} = require('./legacy-migration');
 const { SessionManager, friendlyError } = require('./session-manager');
 const {
   formatPhone,
@@ -14,6 +20,7 @@ const { QueueManager } = require('./queue');
 const { parseSpreadsheet } = require('./spreadsheet');
 const { importContacts } = require('./contact-import');
 const { runWithTimeout } = require('./lifecycle');
+const contactDiagnostics = require('./contact-diagnostics');
 
 const STARTUP_STARTED_AT = Date.now();
 
@@ -48,16 +55,34 @@ app.setName('WhatsApp Group Manager');
 
 let mainWindow = null;
 let db = null;
+let vault = null;
 let sessions = null;
 let queue = null;
 let currentUser = null;
+let mustChangePassword = false;
+let databaseState = 'missing';
+let lastActivityAt = Date.now();
+let lastAuthAt = 0;
+let autoLockWarned = false;
+let autoLockTimer = null;
 let quitting = false;
 
 const DATA_DIR = process.env.WGM_DATA_DIR
   ? path.resolve(process.env.WGM_DATA_DIR)
   : app.getPath('userData');
 const DB_FILE = path.join(DATA_DIR, 'whatsapp-group-manager.json');
+const VAULT_FILE = path.join(DATA_DIR, 'auth-vault.json');
 const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
+const TRUSTED_PATH = path.join(__dirname, '..', 'src', 'index.html');
+const TRUSTED_URL = pathToFileURL(TRUSTED_PATH).href;
+const PUBLIC_CHANNELS = new Set([
+  'auth:status',
+  'auth:setup',
+  'auth:login',
+  'auth:loginRecovery',
+  'auth:resetWithRecovery'
+]);
+const IPC_RATE = new Map();
 
 function broadcast(channel, payload) {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -71,12 +96,96 @@ function broadcast(channel, payload) {
   }
 }
 
-function deriveKey(password, saltHex) {
-  return Buffer.from(crypto.scryptSync(password, Buffer.from(saltHex, 'hex'), 32));
+async function finishUnlock(dek, options = {}) {
+  if (db.inspect().kind === 'encrypted') {
+    db.unlock(dek);
+  } else {
+    await encryptLegacyDatabase({
+      db,
+      filePath: DB_FILE,
+      dek,
+      oldKey: options.oldKey || null,
+      sessionsRoot: SESSIONS_DIR
+    });
+  }
+  const masterKey = Buffer.from(db.data.security.sessionMasterKey || '', 'base64');
+  if (masterKey.length !== 32) throw new Error('The encrypted database session key is invalid.');
+  databaseState = 'encrypted';
+  sessions.setMasterKey(masterKey);
+  currentUser = vault.getUsername();
+  mustChangePassword = Boolean(options.mustChangePassword);
+  lastActivityAt = Date.now();
+  lastAuthAt = Date.now();
+  autoLockWarned = false;
+  startupLog('Login accepted; starting sessions in background');
+  sessions.startAll().catch((error) => {
+    startupError('Failed to start sessions after login', error);
+  });
+  queue.start();
+  broadcast('auth:changed', { authenticated: true });
+  return { username: currentUser, mustChangePassword };
+}
+
+function startAutoLockTimer() {
+  if (autoLockTimer) clearInterval(autoLockTimer);
+  autoLockTimer = setInterval(() => {
+    if (!currentUser || !db || db.mode !== 'encrypted') return;
+    const minutes = Number(db.data.settings.autoLockMinutes) || 0;
+    if (minutes <= 0) return;
+    const idleMs = Date.now() - lastActivityAt;
+    const timeoutMs = minutes * 60 * 1000;
+    if (idleMs < timeoutMs - 120000) return;
+    if (idleMs < timeoutMs) {
+      if (!autoLockWarned) {
+        autoLockWarned = true;
+        broadcast('auth:idleWarning', { minutes });
+      }
+      return;
+    }
+    lockApp().catch((error) => startupError('Auto-lock failed', error));
+  }, 15000);
+}
+
+async function lockApp() {
+  if (queue) await queue.pauseAndWait(5000);
+  if (sessions) {
+    await sessions.stopAll();
+    sessions.setMasterKey(null);
+  }
+  if (db) db.lock();
+  if (vault) vault.lock();
+  currentUser = null;
+  mustChangePassword = false;
+  lastActivityAt = Date.now();
+  lastAuthAt = 0;
+  autoLockWarned = false;
+  broadcast('auth:changed', { authenticated: false });
 }
 
 function requireAuth() {
-  if (!currentUser) throw new Error('Please log in first.');
+  if (!currentUser || db.mode !== 'encrypted') throw new Error('Please log in first.');
+}
+
+function requireRecentAuth() {
+  requireAuth();
+  if (!lastAuthAt || Date.now() - lastAuthAt > 10 * 60 * 1000) {
+    throw ipcError('reauth_required', 'Confirm your password to continue.');
+  }
+}
+
+function requiredId(value, label, max = 160) {
+  if (typeof value !== 'string') throw new Error(`${label} is invalid.`);
+  const clean = value.trim();
+  if (!clean || clean.length > max || /[\u0000-\u001f\u007f]/.test(clean)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return clean;
+}
+
+function requireArray(value, label, max) {
+  if (!Array.isArray(value)) throw new Error(`${label} must be a list.`);
+  if (value.length > max) throw new Error(`${label} is limited to ${max} items.`);
+  return value;
 }
 
 function adminAccessSummary(account) {
@@ -201,8 +310,10 @@ function serializeContacts() {
 
 function snapshot() {
   return {
-    hasUser: Boolean(db.data.auth),
+    hasUser: Boolean(vault && vault.exists()) || Boolean(db.data.auth),
     authenticated: Boolean(currentUser),
+    locked: Boolean(vault && vault.exists()) && !currentUser,
+    mustChangePassword,
     user: currentUser,
     accounts: db.data.accounts.map(publicAccount),
     groups: db.data.groups.map(groupSummary),
@@ -212,14 +323,116 @@ function snapshot() {
   };
 }
 
+function ipcError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function trustedSender(event) {
+  const frame = event && event.senderFrame;
+  if (!frame || frame.parent) return false;
+  try {
+    return fileURLToPath(frame.url) === TRUSTED_PATH;
+  } catch (error) {
+    return false;
+  }
+}
+
+function checkIpcRate(channel) {
+  const now = Date.now();
+  const windowMs = 60 * 1000;
+  const limit = channel.startsWith('auth:') ? 20 : 180;
+  const recent = (IPC_RATE.get(channel) || []).filter((at) => now - at < windowMs);
+  if (recent.length >= limit) throw ipcError('rate_limited', 'Too many requests. Wait a moment and try again.');
+  recent.push(now);
+  IPC_RATE.set(channel, recent);
+}
+
+function safeIpcError(error) {
+  const message = friendlyError(error);
+  return message
+    .replace(/(?:[A-Za-z]:\\|\/)[^\s:'"]+(?:[\\/][^\s:'"]+)+/g, '[local path]')
+    .replace(/WGM-[A-Z0-9-]{8,}/gi, '[recovery key]');
+}
+
+const IPC_SCHEMAS = {
+  'auth:status': [],
+  'auth:setup': ['string', 'string', 'string?'],
+  'auth:login': ['string', 'string'],
+  'auth:loginRecovery': ['string'],
+  'auth:resetWithRecovery': ['string', 'string'],
+  'auth:reauth': ['string'],
+  'auth:changePassword': ['string', 'string'],
+  'auth:regenerateRecovery': ['string'],
+  'auth:lock': [],
+  'auth:logoutApp': [],
+  'app:snapshot': [],
+  'groups:fetchAvailable': ['string'],
+  'groups:add': ['string', 'array'],
+  'groups:get': ['string'],
+  'groups:refresh': ['string'],
+  'groups:deleteLocal': ['string'],
+  'members:context': ['string', 'string'],
+  'jobs:create': ['object'],
+  'jobs:list': [],
+  'jobs:dismiss': ['string'],
+  'contacts:list': [],
+  'contacts:refresh': [],
+  'contacts:import': ['array'],
+  'accounts:list': [],
+  'accounts:add': ['string'],
+  'accounts:relink': ['string'],
+  'accounts:remove': ['string'],
+  'settings:get': [],
+  'settings:update': ['object'],
+  'import:parse': ['string', 'binary'],
+  'app:dataDir': []
+};
+
+function validateIpcArgs(channel, schema, args) {
+  const required = schema.filter((type) => !type.endsWith('?')).length;
+  if (args.length < required || args.length > schema.length) {
+    throw ipcError('invalid_request', 'Invalid request arguments.');
+  }
+  for (let index = 0; index < args.length; index += 1) {
+    const type = schema[index].replace(/\?$/, '');
+    const value = args[index];
+    const valid = type === 'string'
+      ? typeof value === 'string'
+      : type === 'array'
+        ? Array.isArray(value)
+        : type === 'object'
+          ? Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+          : type === 'binary'
+            ? value instanceof Uint8Array || value instanceof ArrayBuffer
+            : false;
+    if (!valid) throw ipcError('invalid_request', 'Invalid request arguments.');
+  }
+}
+
 function handle(channel, handler) {
-  ipcMain.handle(channel, async (_event, ...args) => {
+  ipcMain.handle(channel, async (event, ...args) => {
     try {
+      if (!trustedSender(event)) throw ipcError('untrusted_sender', 'Request blocked.');
+      if (args.length > 6) throw ipcError('invalid_request', 'Too many arguments.');
+      if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 16 * 1024 * 1024) {
+        throw ipcError('invalid_request', 'Request is too large.');
+      }
+      if (!PUBLIC_CHANNELS.has(channel) && (!currentUser || db.mode !== 'encrypted')) {
+        throw ipcError('auth_required', 'Please log in first.');
+      }
+      checkIpcRate(channel);
+      validateIpcArgs(channel, IPC_SCHEMAS[channel] || [], args);
+      if (currentUser) {
+        lastActivityAt = Date.now();
+        autoLockWarned = false;
+      }
       const data = await handler(...args);
       return { ok: true, data };
     } catch (error) {
       console.error(`IPC ${channel} failed:`, error);
-      return { ok: false, error: friendlyError(error) };
+      return { ok: false, error: safeIpcError(error), code: error && error.code ? error.code : 'error' };
     }
   });
 }
@@ -234,7 +447,8 @@ function validateSettings(patch) {
     batchSize: [1, 100],
     batchPauseMinSeconds: [30, 7200],
     batchPauseMaxSeconds: [30, 7200],
-    failurePauseThreshold: [1, 20]
+    failurePauseThreshold: [1, 20],
+    autoLockMinutes: [1, 240]
   };
   for (const key of Object.keys(numbers)) {
     if (patch[key] === undefined) continue;
@@ -300,10 +514,34 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      nodeIntegrationInWorker: false,
+      nodeIntegrationInSubFrames: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      devTools: !app.isPackaged,
       spellcheck: false
     }
   });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (url !== TRUSTED_URL) {
+      event.preventDefault();
+      startupLog('Blocked renderer navigation', { url });
+    }
+  });
+  mainWindow.webContents.on('will-redirect', (event, url) => {
+    event.preventDefault();
+    startupLog('Blocked renderer redirect', { url });
+  });
+  mainWindow.webContents.on('will-attach-webview', (event) => {
+    event.preventDefault();
+  });
+  mainWindow.webContents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false);
+  });
+  mainWindow.webContents.session.setPermissionCheckHandler(() => false);
   let windowShown = false;
   let showFallbackTimer = null;
   const showWindow = (reason) => {
@@ -359,12 +597,11 @@ function createWindow() {
     showWindow('fallback-timeout');
   }, 5000);
 
-  mainWindow.loadFile(path.join(__dirname, '..', 'src', 'index.html')).catch((error) => {
+  mainWindow.loadFile(TRUSTED_PATH).catch((error) => {
     startupError('loadFile failed', error);
     showWindowLoadError(error && error.message ? error.message : 'The application files could not be loaded.');
     showWindow('loadFile-catch');
   });
-  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.on('closed', () => {
     if (showFallbackTimer) clearTimeout(showFallbackTimer);
     mainWindow = null;
@@ -406,59 +643,106 @@ function wireEvents() {
 }
 
 function registerIpc() {
-  handle('auth:status', async () => ({
-    hasUser: Boolean(db.data.auth),
-    authenticated: Boolean(currentUser),
-    username: currentUser,
-    dataDir: DATA_DIR
-  }));
+  handle('auth:status', async () => {
+    const hasVault = Boolean(vault && vault.exists());
+    return {
+      hasUser: hasVault || Boolean(db.data.auth),
+      authenticated: Boolean(currentUser),
+      locked: hasVault && !currentUser,
+      needsMigration: Boolean(db.data.auth) && !hasVault,
+      mustChangePassword,
+      username: currentUser || (hasVault ? vault.getUsername() : (db.data.auth ? db.data.auth.username : '')),
+      databaseEncrypted: databaseState === 'encrypted',
+      vaultMissing: databaseState === 'encrypted' && !hasVault,
+      dataDir: DATA_DIR
+    };
+  });
 
-  handle('auth:setup', async (username, password) => {
-    if (db.data.auth) throw new Error('A local login already exists.');
+  handle('auth:setup', async (username, password, currentPassword) => {
+    if (vault && vault.exists()) {
+      const unlocked = vault.unlockWithPassword(username, currentPassword || password);
+      return finishUnlock(unlocked.dek, { mustChangePassword: unlocked.mustChangePassword });
+    }
     const cleanUser = String(username || '').trim();
     if (cleanUser.length < 3) throw new Error('Username must be at least 3 characters.');
     if (cleanUser.length > 40) throw new Error('Username must be 40 characters or fewer.');
-    if (String(password || '').length < 6) throw new Error('Password must be at least 6 characters.');
-    const saltHex = crypto.randomBytes(16).toString('hex');
-    db.data.auth = {
-      username: cleanUser,
-      passwordHash: bcrypt.hashSync(password, 12),
-      kdfSalt: saltHex,
-      createdAt: new Date().toISOString()
-    };
-    db.save();
-    currentUser = cleanUser;
-    sessions.setMasterKey(deriveKey(password, saltHex));
-    startupLog('Local login created; starting sessions in background');
-    sessions.startAll().catch((error) => {
-      startupError('Failed to start sessions after setup', error);
-    });
-    queue.start();
-    broadcast('auth:changed', { authenticated: true });
-    return { username: cleanUser };
+    let oldKey = null;
+    if (db.data.auth) {
+      if (cleanUser !== db.data.auth.username) throw new Error('Use the existing username to migrate this app.');
+      const legacyPassword = String(currentPassword || password || '');
+      if (!bcrypt.compareSync(legacyPassword, db.data.auth.passwordHash)) {
+        throw new Error('Enter the existing password to migrate this app.');
+      }
+      oldKey = deriveLegacyKey(legacyPassword, db.data.auth.kdfSalt);
+    }
+    const created = vault.create({ username: cleanUser, password });
+    try {
+      await encryptLegacyDatabase({
+        db,
+        filePath: DB_FILE,
+        dek: created.dek,
+        oldKey,
+        sessionsRoot: SESSIONS_DIR
+      });
+      await finishUnlock(created.dek, { mustChangePassword: false });
+    } catch (error) {
+      vault.lock();
+      throw error;
+    }
+    return { username: cleanUser, recoveryCode: created.recoveryCode };
   });
 
   handle('auth:login', async (username, password) => {
-    if (!db.data.auth) throw new Error('No local login exists yet. Create one first.');
-    const validUser = String(username || '').trim() === db.data.auth.username;
-    const validPassword = bcrypt.compareSync(String(password || ''), db.data.auth.passwordHash);
-    if (!validUser || !validPassword) throw new Error('Incorrect username or password.');
-    currentUser = db.data.auth.username;
-    sessions.setMasterKey(deriveKey(String(password), db.data.auth.kdfSalt));
-    startupLog('Login accepted; starting sessions in background');
-    sessions.startAll().catch((error) => {
-      startupError('Failed to start sessions after login', error);
-    });
-    queue.start();
-    broadcast('auth:changed', { authenticated: true });
-    return { username: currentUser };
+    if (!vault || !vault.exists()) throw new Error('No local login exists yet. Create one first.');
+    const unlocked = vault.unlockWithPassword(username, password);
+    return finishUnlock(unlocked.dek, { mustChangePassword: unlocked.mustChangePassword });
+  });
+
+  handle('auth:loginRecovery', async (recoveryCode) => {
+    if (!vault || !vault.exists()) throw new Error('No local login exists yet. Create one first.');
+    const unlocked = vault.unlockWithRecovery(recoveryCode);
+    return finishUnlock(unlocked.dek, { mustChangePassword: false });
+  });
+
+  handle('auth:resetWithRecovery', async (recoveryCode, newPassword) => {
+    if (!vault || !vault.exists()) throw new Error('No local login exists yet.');
+    if (currentUser) throw new Error('Lock the app before resetting the password.');
+    const reset = vault.resetWithRecovery(recoveryCode, newPassword);
+    await finishUnlock(reset.dek, { mustChangePassword: false });
+    return { username: currentUser, recoveryCode: reset.recoveryCode };
+  });
+
+  handle('auth:reauth', async (password) => {
+    requireAuth();
+    vault.verifyPassword(vault.getUsername(), password);
+    lastAuthAt = Date.now();
+    lastActivityAt = Date.now();
+    return true;
+  });
+
+  handle('auth:changePassword', async (currentPassword, newPassword) => {
+    requireAuth();
+    const changed = vault.changePassword(currentPassword, newPassword);
+    mustChangePassword = false;
+    lastAuthAt = Date.now();
+    return { recoveryCode: changed.recoveryCode };
+  });
+
+  handle('auth:regenerateRecovery', async (password) => {
+    requireRecentAuth();
+    const result = vault.regenerateRecovery(password);
+    lastAuthAt = Date.now();
+    return result;
+  });
+
+  handle('auth:lock', async () => {
+    requireAuth();
+    await lockApp();
+    return true;
   });
 
   handle('auth:logoutApp', async () => {
-    queue.pause();
-    await sessions.stopAll();
-    currentUser = null;
-    broadcast('auth:changed', { authenticated: false });
+    await lockApp();
     return true;
   });
 
@@ -469,36 +753,46 @@ function registerIpc() {
 
   handle('groups:fetchAvailable', async (accountId) => {
     requireAuth();
-    return sessions.fetchGroups(accountId);
+    const id = requiredId(accountId, 'Account');
+    if (!db.findAccount(id)) throw new Error('Account not found.');
+    return sessions.fetchGroups(id);
   });
 
   handle('groups:add', async (accountId, groupIds) => {
-    requireAuth();
-    const count = await sessions.addGroups(accountId, groupIds);
+    requireRecentAuth();
+    const id = requiredId(accountId, 'Account');
+    if (!db.findAccount(id)) throw new Error('Account not found.');
+    const ids = requireArray(groupIds, 'Groups', 500).map((groupId) => requiredId(groupId, 'Group'));
+    const count = await sessions.addGroups(id, ids);
     broadcast('groups:update', db.data.groups.map(fullGroup));
     return { added: count };
   });
 
   handle('groups:get', async (groupId) => {
     requireAuth();
-    const group = db.findGroup(groupId);
+    const id = requiredId(groupId, 'Group');
+    const group = db.findGroup(id);
     if (!group) throw new Error('Group not found.');
-    await sessions.refreshGroup(groupId).catch(() => null);
-    return fullGroup(db.findGroup(groupId));
+    await sessions.refreshGroup(id).catch(() => null);
+    return fullGroup(db.findGroup(id));
   });
 
   handle('groups:refresh', async (groupId) => {
     requireAuth();
-    await sessions.refreshGroup(groupId, { strict: true });
-    return fullGroup(db.findGroup(groupId));
+    const id = requiredId(groupId, 'Group');
+    await sessions.refreshGroup(id, { strict: true });
+    const group = db.findGroup(id);
+    if (!group) throw new Error('Group not found.');
+    return fullGroup(group);
   });
 
   handle('groups:deleteLocal', async (groupId) => {
-    requireAuth();
-    const group = db.findGroup(groupId);
+    requireRecentAuth();
+    const id = requiredId(groupId, 'Group');
+    const group = db.findGroup(id);
     if (!group) throw new Error('Group not found.');
-    queue.cancelJobsForGroup(groupId, 'Group removed from the app.');
-    db.data.groups = db.data.groups.filter((item) => item.id !== groupId);
+    queue.cancelJobsForGroup(id, 'Group removed from the app.');
+    db.data.groups = db.data.groups.filter((item) => item.id !== id);
     db.save();
     broadcast('groups:update', db.data.groups.map(fullGroup));
     broadcast('jobs:update', serializeJobs());
@@ -508,13 +802,14 @@ function registerIpc() {
   handle('members:context', async (groupId, mode) => {
     requireAuth();
     if (mode !== 'add' && mode !== 'remove') throw new Error('Unknown member action.');
-    await sessions.refreshGroup(groupId, { strict: true });
-    const group = db.findGroup(groupId);
+    const id = requiredId(groupId, 'Group');
+    await sessions.refreshGroup(id, { strict: true });
+    const group = db.findGroup(id);
     if (!group) throw new Error('Group not found.');
     const pendingNumbers = [];
     const pendingTargets = [];
     for (const job of db.data.jobs) {
-      if (job.groupId !== groupId || job.type !== mode) continue;
+      if (job.groupId !== id || job.type !== mode) continue;
       if (job.status !== 'queued' && job.status !== 'running') continue;
       for (const target of job.targets || []) {
         if (target.status === 'pending' || target.status === 'running') {
@@ -539,15 +834,25 @@ function registerIpc() {
   });
 
   handle('jobs:create', async (payload) => {
-    requireAuth();
-    if (!payload || typeof payload !== 'object') throw new Error('Invalid job request.');
-    await sessions.refreshGroup(payload.groupId, { strict: true });
+    requireRecentAuth();
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid job request.');
+    const groupId = requiredId(payload.groupId, 'Group');
+    if (payload.type !== 'add' && payload.type !== 'remove') throw new Error('Unknown job type.');
+    const numbers = requireArray(payload.numbers || [], 'Recipients', 5000);
+    const targets = payload.targets === null || payload.targets === undefined
+      ? null
+      : requireArray(payload.targets, 'Recipients', 5000);
+    const names = payload.names && typeof payload.names === 'object' && !Array.isArray(payload.names)
+      ? payload.names
+      : {};
+    if (Object.keys(names).length > 5000) throw new Error('Too many recipient names.');
+    await sessions.refreshGroup(groupId, { strict: true });
     const job = queue.createJob({
       type: payload.type,
-      groupId: payload.groupId,
-      numbers: payload.numbers || [],
-      names: payload.names || {},
-      targets: payload.targets || null
+      groupId,
+      numbers,
+      names,
+      targets
     });
     return { id: job.id, total: job.targets.length };
   });
@@ -559,7 +864,7 @@ function registerIpc() {
 
   handle('jobs:dismiss', async (jobId) => {
     requireAuth();
-    return queue.dismissJob(jobId);
+    return queue.dismissJob(requiredId(jobId, 'Job'));
   });
 
   handle('contacts:list', async () => {
@@ -579,8 +884,8 @@ function registerIpc() {
   });
 
   handle('contacts:import', async (rows) => {
-    requireAuth();
-    if (!Array.isArray(rows)) throw new Error('Invalid contact import.');
+    requireRecentAuth();
+    requireArray(rows, 'Contacts', 5000);
     const result = importContacts(db, rows);
     let namesChanged = 0;
     if (result.imported > 0) {
@@ -607,20 +912,25 @@ function registerIpc() {
   });
 
   handle('accounts:add', async (alias) => {
-    requireAuth();
+    requireRecentAuth();
+    if (typeof alias !== 'string' || !alias.trim()) throw new Error('Give this account an alias.');
     const id = await sessions.addAccount(alias);
     return { id };
   });
 
   handle('accounts:relink', async (accountId) => {
-    requireAuth();
-    await sessions.relinkAccount(accountId);
+    requireRecentAuth();
+    const id = requiredId(accountId, 'Account');
+    if (!db.findAccount(id)) throw new Error('Account not found.');
+    await sessions.relinkAccount(id);
     return true;
   });
 
   handle('accounts:remove', async (accountId) => {
-    requireAuth();
-    await sessions.removeAccount(accountId);
+    requireRecentAuth();
+    const id = requiredId(accountId, 'Account');
+    if (!db.findAccount(id)) throw new Error('Account not found.');
+    await sessions.removeAccount(id);
     broadcast('groups:update', db.data.groups.map(fullGroup));
     return true;
   });
@@ -631,7 +941,7 @@ function registerIpc() {
   });
 
   handle('settings:update', async (patch) => {
-    requireAuth();
+    requireRecentAuth();
     const next = validateSettings(patch || {});
     db.data.settings = next;
     for (const account of db.data.accounts) {
@@ -661,32 +971,72 @@ function registerIpc() {
 
 async function boot() {
   startupLog('Application starting');
-  const stage = (label, operation) => {
+  const stage = async (label, operation) => {
     const startedAt = Date.now();
     startupLog(`${label}...`);
-    const result = operation();
+    const result = await operation();
     startupLog(`${label} OK (${Date.now() - startedAt}ms)`);
     return result;
   };
 
-  stage('Initializing directories', () => {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  await stage('Initializing directories', () => {
+    ensurePrivateDir(DATA_DIR);
+    ensurePrivateDir(SESSIONS_DIR);
+    contactDiagnostics.configure(DATA_DIR);
   });
-  stage('Loading database', () => {
+  await stage('Loading local security vault', () => {
+    vault = new AuthVault(VAULT_FILE);
+    vault.load();
+  });
+  await stage('Loading database', () => {
     db = new Database(DB_FILE);
+    let info = null;
+    try {
+      info = db.inspect();
+    } catch (error) {
+      let looksEncrypted = false;
+      try {
+        looksEncrypted = fs.readFileSync(DB_FILE, 'utf8').slice(0, 4096).includes('"wgm-encrypted-db"');
+      } catch (_) {
+        looksEncrypted = false;
+      }
+      if (looksEncrypted) {
+        db.mode = 'locked';
+        databaseState = 'encrypted';
+        startupError('The encrypted database is unreadable; refusing to replace it', error);
+        return;
+      }
+      info = null;
+    }
+    if (!info || info.kind === 'missing') {
+      db.mode = 'locked';
+      databaseState = 'locked';
+      return;
+    }
+    if (info.kind === 'encrypted') {
+      if (!vault.exists()) {
+        startupError('An encrypted database exists without its local security vault', new Error('Missing auth-vault.json'));
+      }
+      db.mode = 'locked';
+      databaseState = 'encrypted';
+      return;
+    }
     db.load();
+    databaseState = db.mode;
   });
-  stage('Resetting daily counters', () => db.resetDailyCounters());
-  stage('Initializing session manager', () => {
+  await stage('Resetting daily counters', () => {
+    if (db.mode !== 'locked') db.resetDailyCounters();
+  });
+  await stage('Initializing session manager', () => {
     sessions = new SessionManager({ db, sessionsRoot: SESSIONS_DIR });
   });
-  stage('Initializing queue manager', () => {
+  await stage('Initializing queue manager', () => {
     queue = new QueueManager({ db, sessions });
   });
-  stage('Wiring events', () => wireEvents());
-  stage('Registering IPC', () => registerIpc());
-  stage('Creating window', () => createWindow());
+  await stage('Starting auto-lock', () => startAutoLockTimer());
+  await stage('Wiring events', () => wireEvents());
+  await stage('Registering IPC', () => registerIpc());
+  await stage('Creating window', () => createWindow());
   startupLog('Application ready');
 }
 
@@ -719,6 +1069,7 @@ if (!singleInstance) {
     if (quitting) return;
     event.preventDefault();
     quitting = true;
+    if (autoLockTimer) clearInterval(autoLockTimer);
     if (queue) queue.pause();
     const finish = () => app.quit();
     if (!sessions) {

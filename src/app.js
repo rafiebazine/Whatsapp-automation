@@ -19,6 +19,10 @@ const state = {
   subscriptionsReady: false,
   settingsDirty: false,
   loginMode: 'login',
+  needsMigration: false,
+  locked: false,
+  vaultMissing: false,
+  mustChangePassword: false,
   booting: true
 };
 
@@ -213,19 +217,80 @@ function conversationLabel(job) {
 }
 
 async function call(channel, args = [], options = {}) {
-  let response;
-  try {
-    response = await window.api.invoke(channel, ...args);
-  } catch (error) {
-    if (!options.silent) showToast(error.message || 'The app could not complete this action.', 'error');
-    throw error;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let response;
+    try {
+      response = await window.api.invoke(channel, ...args);
+    } catch (error) {
+      if (!options.silent) showToast(error.message || 'The app could not complete this action.', 'error');
+      throw error;
+    }
+    if (!response || !response.ok) {
+      const message = (response && response.error) || 'The app could not complete this action.';
+      if (attempt === 0 && response && response.code === 'reauth_required') {
+        const confirmed = await promptReauth();
+        if (confirmed) continue;
+      }
+      if (!options.silent) showToast(message, 'error');
+      const failure = new Error(message);
+      failure.code = response && response.code;
+      throw failure;
+    }
+    return response.data;
   }
-  if (!response || !response.ok) {
-    const message = (response && response.error) || 'The app could not complete this action.';
-    if (!options.silent) showToast(message, 'error');
-    throw new Error(message);
-  }
-  return response.data;
+  throw new Error('The app could not complete this action.');
+}
+
+function promptReauth() {
+  return new Promise((resolve) => {
+    openModal(`
+      <div class="modal-head">
+        <div class="settings-icon">${icon('shield', 22)}</div>
+        <div><h3>Confirm your password</h3><p>This is a sensitive change. Confirm the local password to continue.</p></div>
+      </div>
+      <form id="reauth-form">
+        <div id="reauth-error" class="form-error"></div>
+        <div class="field">
+          <label for="reauth-password">Password</label>
+          <input id="reauth-password" class="input" type="password" autocomplete="current-password">
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-secondary" data-close-modal type="button">Cancel</button>
+          <button class="btn btn-primary" id="reauth-submit" type="submit">Confirm</button>
+        </div>
+      </form>
+    `, { onClose: () => resolve(false) });
+    const form = document.getElementById('reauth-form');
+    const errorBox = document.getElementById('reauth-error');
+    const submit = document.getElementById('reauth-submit');
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (submit.disabled) return;
+      const password = document.getElementById('reauth-password').value;
+      if (!password) {
+        errorBox.textContent = 'Enter your password.';
+        errorBox.classList.add('visible');
+        return;
+      }
+      submit.disabled = true;
+      submit.textContent = 'Confirming…';
+      try {
+        const response = await window.api.invoke('auth:reauth', password);
+        if (!response || !response.ok) throw new Error((response && response.error) || 'Password confirmation failed.');
+        closeModal();
+        resolve(true);
+      } catch (error) {
+        errorBox.textContent = error.message;
+        errorBox.classList.add('visible');
+        submit.disabled = false;
+        submit.textContent = 'Confirm';
+      }
+    });
+    setTimeout(() => {
+      const input = document.getElementById('reauth-password');
+      if (input) input.focus();
+    }, 40);
+  });
 }
 
 function showToast(message, type = 'info') {
@@ -337,6 +402,8 @@ async function loadSnapshot() {
   state.hasUser = data.hasUser;
   state.auth = data.authenticated;
   state.user = data.user;
+  state.locked = Boolean(data.locked);
+  state.mustChangePassword = Boolean(data.mustChangePassword);
   state.accounts = data.accounts || [];
   state.groups = data.groups || [];
   state.jobs = data.jobs || [];
@@ -353,11 +420,14 @@ async function enterApp() {
   showAppRoot();
   state.page = 'home';
   renderHome();
+  if (state.mustChangePassword) openPasswordChangeModal({ required: true });
 }
 
 function showLogin() {
   state.auth = false;
   state.user = null;
+  state.locked = true;
+  state.loginMode = 'login';
   state.page = 'login';
   state.pageData = {};
   state.groups = [];
@@ -372,14 +442,45 @@ function showLogin() {
 }
 
 function renderLogin() {
-  const setup = !state.hasUser;
+  const vaultMissing = Boolean(state.vaultMissing);
+  const setup = !state.hasUser && !state.needsMigration && !vaultMissing;
+  const migration = state.needsMigration;
+  const recovery = state.loginMode === 'recovery';
+  const reset = state.loginMode === 'reset';
   const root = document.getElementById('login-root');
-  const title = setup ? 'Create your local login' : 'Welcome back';
-  const eyebrow = setup ? 'First-time setup' : 'Local access';
-  const lead = setup
-    ? 'Set a username and password for this computer. This login never leaves your machine.'
-    : 'Sign in to manage your groups, accounts, and pacing.';
-  const action = setup ? 'Create login' : 'Log in';
+  const title = vaultMissing
+    ? 'Restore the security vault'
+    : migration
+    ? 'Secure this installation'
+    : setup
+      ? 'Create your local login'
+      : reset
+        ? 'Reset with your recovery key'
+        : recovery
+          ? 'Unlock with your recovery key'
+          : 'Welcome back';
+  const eyebrow = vaultMissing ? 'Recovery required' : migration ? 'Security upgrade' : setup ? 'First-time setup' : 'Local access';
+  const lead = vaultMissing
+    ? 'The encrypted database exists, but its local security vault is missing. Restore auth-vault.json from backup before signing in.'
+    : migration
+    ? 'This version encrypts the local database. Enter the existing login once and choose a new password of at least 12 characters.'
+    : setup
+      ? 'Set a username and password for this computer. A recovery key will be shown once.'
+      : reset
+        ? 'Enter your recovery key and choose a new password. A new recovery key will replace the old one.'
+        : recovery
+          ? 'Enter the recovery key you saved during setup.'
+          : 'Sign in to manage your groups, accounts, and pacing.';
+  const action = vaultMissing ? 'Locked' : migration ? 'Secure this app' : setup ? 'Create login' : reset ? 'Reset password' : recovery ? 'Unlock' : 'Log in';
+  const recoveryLink = (!vaultMissing && !setup && !migration && !recovery && !reset)
+    ? '<button type="button" class="btn btn-ghost btn-block" data-login-mode="recovery">Use recovery key</button>'
+    : '';
+  const resetLink = recovery
+    ? '<button type="button" class="btn btn-ghost btn-block" data-login-mode="reset">Reset password instead</button>'
+    : '';
+  const loginLink = (recovery || reset)
+    ? '<button type="button" class="btn btn-ghost btn-block" data-login-mode="login">Back to password login</button>'
+    : '';
   root.innerHTML = `
     <div class="login-shell">
       <aside class="login-art">
@@ -389,7 +490,7 @@ function renderLogin() {
           <p>Run adding and removing jobs across up to four admin accounts with human-like pacing, right from your desktop.</p>
         </div>
         <div class="login-features">
-          <div class="login-feature"><span class="dot">${icon('shield', 16)}</span> Encrypted local sessions on your machine</div>
+          <div class="login-feature"><span class="dot">${icon('shield', 16)}</span> AES-256-GCM encrypted local data</div>
           <div class="login-feature"><span class="dot">${icon('clock', 16)}</span> Random delays, daily caps and quiet hours</div>
           <div class="login-feature"><span class="dot">${icon('users', 16)}</span> Up to 4 admin accounts, fully offline</div>
         </div>
@@ -398,30 +499,51 @@ function renderLogin() {
         <div class="eyebrow">${eyebrow}</div>
         <h2>${title}</h2>
         <p class="lead">${lead}</p>
+        ${state.vaultMissing ? '<div class="form-error visible">The encrypted database exists, but auth-vault.json is missing. Restore that file from backup; without it the data cannot be decrypted.</div>' : ''}
         <div id="login-error" class="form-error"></div>
         <form id="login-form" autocomplete="off">
+          ${!recovery && !reset ? `
           <div class="field">
             <label for="login-username">Username</label>
-            <input id="login-username" class="input" type="text" autocomplete="username" placeholder="e.g. operator" maxlength="40">
-          </div>
-          <div class="field">
-            <label for="login-password">Password</label>
-            <input id="login-password" class="input" type="password" autocomplete="${setup ? 'new-password' : 'current-password'}" placeholder="At least 6 characters">
-          </div>
-          ${setup ? `
-          <div class="field">
-            <label for="login-confirm">Confirm password</label>
-            <input id="login-confirm" class="input" type="password" autocomplete="new-password" placeholder="Repeat your password">
+            <input id="login-username" class="input" type="text" autocomplete="username" placeholder="e.g. operator" maxlength="40" value="${migration ? esc(state.user || '') : ''}">
           </div>` : ''}
-          <button id="login-submit" class="btn btn-primary btn-block btn-lg" type="submit">${action}</button>
+          ${(recovery || reset) ? `
+          <div class="field">
+            <label for="login-recovery">Recovery key</label>
+            <input id="login-recovery" class="input" type="text" autocomplete="off" placeholder="WGM-XXXXX-..." spellcheck="false">
+          </div>` : ''}
+          ${migration ? `
+          <div class="field">
+            <label for="login-current">Existing password</label>
+            <input id="login-current" class="input" type="password" autocomplete="current-password" placeholder="Your current password">
+          </div>` : ''}
+          ${!recovery ? `
+          <div class="field">
+            <label for="login-password">${setup || migration || reset ? 'New password' : 'Password'}</label>
+            <input id="login-password" class="input" type="password" autocomplete="${setup || migration || reset ? 'new-password' : 'current-password'}" placeholder="${setup || migration || reset ? 'At least 12 characters' : 'Your password'}">
+          </div>` : ''}
+          ${(setup || migration || reset) ? `
+          <div class="field">
+            <label for="login-confirm">Confirm new password</label>
+            <input id="login-confirm" class="input" type="password" autocomplete="new-password" placeholder="Repeat the new password">
+          </div>` : ''}
+          <button id="login-submit" class="btn btn-primary btn-block btn-lg" type="submit" ${vaultMissing ? 'disabled' : ''}>${action}</button>
+          ${recoveryLink}${resetLink}${loginLink}
         </form>
         <div class="login-note">
-          ${setup
-            ? 'This is a single local operator login. Store it safely — there is no remote recovery. The reset procedure is documented in README.md.'
-            : 'Local-only gate for this computer. WhatsApp sessions stay linked when you sign out of the app.'}
+          ${setup || migration
+            ? 'Your recovery key is shown once after setup. Store it offline; it can unlock the local database if you forget the password.'
+            : 'Local-only gate for this computer. WhatsApp sessions stay linked when you lock or sign out of the app.'}
         </div>
       </section>
     </div>`;
+
+  root.querySelectorAll('[data-login-mode]').forEach((button) => {
+    button.addEventListener('click', () => {
+      state.loginMode = button.getAttribute('data-login-mode');
+      renderLogin();
+    });
+  });
 
   const form = document.getElementById('login-form');
   const errorBox = document.getElementById('login-error');
@@ -430,40 +552,53 @@ function renderLogin() {
     event.preventDefault();
     if (submit.disabled) return;
     errorBox.classList.remove('visible');
-    const username = document.getElementById('login-username').value.trim();
-    const password = document.getElementById('login-password').value;
-    if (!username) {
-      errorBox.textContent = 'Enter your username.';
+    const showError = (message) => {
+      errorBox.textContent = message;
       errorBox.classList.add('visible');
-      return;
+    };
+    const usernameInput = document.getElementById('login-username');
+    const username = usernameInput ? usernameInput.value.trim() : '';
+    const passwordInput = document.getElementById('login-password');
+    const password = passwordInput ? passwordInput.value : '';
+    const currentInput = document.getElementById('login-current');
+    const currentPassword = currentInput ? currentInput.value : '';
+    const recoveryInput = document.getElementById('login-recovery');
+    const recoveryCode = recoveryInput ? recoveryInput.value.trim() : '';
+    const confirmInput = document.getElementById('login-confirm');
+    const confirm = confirmInput ? confirmInput.value : '';
+
+    if (!recovery && !reset) {
+      if (!username) return showError('Enter your username.');
+      if (username.length < 3 || username.length > 40) return showError('Username must be 3 to 40 characters.');
     }
-    if (password.length < 6) {
-      errorBox.textContent = 'Password must be at least 6 characters.';
-      errorBox.classList.add('visible');
-      return;
+    if ((setup || migration || reset) && password.length < 12) {
+      return showError('New password must be at least 12 characters.');
     }
-    if (setup) {
-      const confirm = document.getElementById('login-confirm').value;
-      if (password !== confirm) {
-        errorBox.textContent = 'The passwords do not match.';
-        errorBox.classList.add('visible');
-        return;
-      }
-    }
+    if (!recovery && !setup && !migration && !reset && !password) return showError('Enter your password.');
+    if ((recovery || reset) && !recoveryCode) return showError('Enter your recovery key.');
+    if (migration && !currentPassword) return showError('Enter the existing password to migrate this app.');
+    if ((setup || migration || reset) && password !== confirm) return showError('The new passwords do not match.');
+
     submit.disabled = true;
-    submit.textContent = setup ? 'Creating…' : 'Signing in…';
+    submit.textContent = setup || migration ? 'Securing…' : reset ? 'Resetting…' : recovery ? 'Unlocking…' : 'Signing in…';
     try {
-      if (setup) {
-        await call('auth:setup', [username, password], { silent: true });
-        state.hasUser = true;
-      } else {
-        await call('auth:login', [username, password], { silent: true });
-      }
+      let result;
+      if (migration) result = await call('auth:setup', [username, password, currentPassword], { silent: true });
+      else if (setup) result = await call('auth:setup', [username, password], { silent: true });
+      else if (reset) result = await call('auth:resetWithRecovery', [recoveryCode, password], { silent: true });
+      else if (recovery) result = await call('auth:loginRecovery', [recoveryCode], { silent: true });
+      else result = await call('auth:login', [username, password], { silent: true });
+
+      state.hasUser = true;
       state.auth = true;
-      state.user = username;
+      state.locked = false;
+      state.needsMigration = false;
+      state.user = result.username || username || state.user;
+      state.mustChangePassword = Boolean(result.mustChangePassword);
       await enterApp();
-      showToast(setup ? 'Local login created.' : 'Signed in.', 'success');
-      if (state.page === 'home' && state.accounts.length === 0) {
+      if (result.recoveryCode) showRecoveryKey(result.recoveryCode);
+      else showToast(setup || migration ? 'Local data secured.' : reset ? 'Password reset.' : 'Signed in.', 'success');
+      if (state.page === 'home' && state.accounts.length === 0 && !result.recoveryCode) {
         showToast('Next: open Settings and link your first admin account.');
       }
     } catch (error) {
@@ -474,9 +609,25 @@ function renderLogin() {
     }
   });
   setTimeout(() => {
-    const username = document.getElementById('login-username');
-    if (username) username.focus();
+    const first = document.getElementById('login-username') || document.getElementById('login-recovery');
+    if (first) first.focus();
   }, 60);
+}
+
+function showRecoveryKey(code) {
+  openModal(`
+    <div class="modal-head">
+      <div class="settings-icon" style="background:var(--warning-soft);color:var(--warning)">${icon('shield', 22)}</div>
+      <div><h3>Save your recovery key</h3><p>This key is shown only now. It can unlock the local database if you forget your password.</p></div>
+    </div>
+    <div class="field">
+      <label>Recovery key</label>
+      <input class="input" type="text" readonly value="${esc(code)}">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" data-close-modal type="button">I saved it</button>
+    </div>
+  `);
 }
 
 function renderHome() {
@@ -1431,6 +1582,10 @@ function automationForm() {
           <label for="set-quiet-end">Quiet hours end</label>
           <input id="set-quiet-end" class="input" type="time" value="${esc(settings.quietEnd || '07:00')}">
         </div>
+        <div class="field">
+          <label for="set-auto-lock">Auto-lock after (minutes)</label>
+          <input id="set-auto-lock" class="input" type="number" min="1" max="240" value="${Number(settings.autoLockMinutes) || 15}">
+        </div>
       </div>
       <div class="settings-actions">
         <button class="btn btn-primary" type="submit" id="save-settings">Save automation settings</button>
@@ -1469,10 +1624,38 @@ function renderSettings() {
         <div class="section-title"><h3>Rotation &amp; pacing</h3></div>
         <div class="card settings-section">${automationForm()}</div>
 
+        <div class="section-title"><h3>Local security</h3></div>
+        <div class="list">
+          <button class="settings-row" id="change-password-row">
+            <div class="settings-icon">${icon('shield', 21)}</div>
+            <div class="row-main">
+              <div class="row-title">Change password</div>
+              <div class="row-subtitle">Rotates the recovery key at the same time</div>
+            </div>
+            <div class="row-trailing">${icon('chevron', 19)}</div>
+          </button>
+          <button class="settings-row" id="regenerate-recovery-row">
+            <div class="settings-icon">${icon('file', 21)}</div>
+            <div class="row-main">
+              <div class="row-title">New recovery key</div>
+              <div class="row-subtitle">Replaces the previous recovery key</div>
+            </div>
+            <div class="row-trailing">${icon('chevron', 19)}</div>
+          </button>
+          <button class="settings-row" id="lock-app-row">
+            <div class="settings-icon">${icon('logout', 21)}</div>
+            <div class="row-main">
+              <div class="row-title">Lock now</div>
+              <div class="row-subtitle">Pauses jobs, stops sessions, and clears keys</div>
+            </div>
+            <div class="row-trailing">${icon('chevron', 19)}</div>
+          </button>
+        </div>
+
         <div class="section-title"><h3>Local data</h3></div>
         <div class="card settings-section">
-          <div class="row-title" style="font-size:14px">Session encryption</div>
-          <div class="helper-text" style="margin-top:5px">Each Baileys auth folder is encrypted with AES-256-GCM using a key derived from your local login password. The database never leaves this computer.</div>
+          <div class="row-title" style="font-size:14px">Encrypted local storage</div>
+          <div class="helper-text" style="margin-top:5px">The database and each Baileys auth folder use AES-256-GCM. The database key is wrapped by your password and recovery key in auth-vault.json.</div>
           <div class="helper-text" style="margin-top:10px">Data folder: <span style="color:var(--ink-soft);word-break:break-all">${esc(state.dataDir || 'Loading…')}</span></div>
         </div>
       </div>
@@ -1484,6 +1667,9 @@ function renderSettings() {
   });
   document.getElementById('contacts-row').addEventListener('click', openContacts);
   document.querySelector('[data-app-logout]').addEventListener('click', openAppLogoutModal);
+  document.getElementById('change-password-row').addEventListener('click', () => openPasswordChangeModal());
+  document.getElementById('regenerate-recovery-row').addEventListener('click', () => openRegenerateRecoveryModal());
+  document.getElementById('lock-app-row').addEventListener('click', () => lockNow());
   bindAccountActions();
   bindAutomationForm();
 
@@ -1568,6 +1754,7 @@ function bindAutomationForm() {
         batchPauseMaxSeconds: batchMax * 60,
         quietStart: document.getElementById('set-quiet-start').value,
         quietEnd: document.getElementById('set-quiet-end').value,
+        autoLockMinutes: Number(document.getElementById('set-auto-lock').value),
         failurePauseThreshold: (state.settings && state.settings.failurePauseThreshold) || 3
       }]);
       state.settings = updated;
@@ -1579,6 +1766,122 @@ function bindAutomationForm() {
       button.textContent = 'Save automation settings';
     }
   });
+}
+
+function openPasswordChangeModal(options = {}) {
+  const required = Boolean(options.required);
+  openModal(`
+    <div class="modal-head">
+      <div class="settings-icon">${icon('shield', 22)}</div>
+      <div><h3>${required ? 'Choose a new password' : 'Change password'}</h3><p>${required ? 'This login still uses an older password. Choose a new one of at least 12 characters.' : 'Changing the password also replaces the recovery key.'}</p></div>
+    </div>
+    <form id="password-change-form">
+      <div id="password-change-error" class="form-error"></div>
+      <div class="field">
+        <label for="password-current">Current password</label>
+        <input id="password-current" class="input" type="password" autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="password-new">New password</label>
+        <input id="password-new" class="input" type="password" autocomplete="new-password" placeholder="At least 12 characters">
+      </div>
+      <div class="field">
+        <label for="password-confirm">Confirm new password</label>
+        <input id="password-confirm" class="input" type="password" autocomplete="new-password">
+      </div>
+      <div class="modal-actions">
+        ${required ? '' : '<button class="btn btn-secondary" data-close-modal type="button">Cancel</button>'}
+        <button class="btn btn-primary" id="password-change-submit" type="submit">Change password</button>
+      </div>
+    </form>
+  `);
+  const form = document.getElementById('password-change-form');
+  const errorBox = document.getElementById('password-change-error');
+  const submit = document.getElementById('password-change-submit');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    const currentPassword = document.getElementById('password-current').value;
+    const newPassword = document.getElementById('password-new').value;
+    const confirm = document.getElementById('password-confirm').value;
+    const showError = (message) => {
+      errorBox.textContent = message;
+      errorBox.classList.add('visible');
+    };
+    if (!currentPassword) return showError('Enter your current password.');
+    if (newPassword.length < 12) return showError('New password must be at least 12 characters.');
+    if (newPassword !== confirm) return showError('The new passwords do not match.');
+    submit.disabled = true;
+    submit.textContent = 'Changing…';
+    try {
+      const result = await call('auth:changePassword', [currentPassword, newPassword]);
+      state.mustChangePassword = false;
+      closeModal();
+      if (result && result.recoveryCode) showRecoveryKey(result.recoveryCode);
+      showToast('Password changed.', 'success');
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.classList.add('visible');
+      submit.disabled = false;
+      submit.textContent = 'Change password';
+    }
+  });
+}
+
+function openRegenerateRecoveryModal() {
+  openModal(`
+    <div class="modal-head">
+      <div class="settings-icon">${icon('file', 22)}</div>
+      <div><h3>Generate a new recovery key</h3><p>The previous recovery key stops working immediately.</p></div>
+    </div>
+    <form id="recovery-regenerate-form">
+      <div id="recovery-regenerate-error" class="form-error"></div>
+      <div class="field">
+        <label for="recovery-password">Confirm your password</label>
+        <input id="recovery-password" class="input" type="password" autocomplete="current-password">
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" data-close-modal type="button">Cancel</button>
+        <button class="btn btn-primary" id="recovery-regenerate-submit" type="submit">Generate key</button>
+      </div>
+    </form>
+  `);
+  const form = document.getElementById('recovery-regenerate-form');
+  const errorBox = document.getElementById('recovery-regenerate-error');
+  const submit = document.getElementById('recovery-regenerate-submit');
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    const password = document.getElementById('recovery-password').value;
+    if (!password) {
+      errorBox.textContent = 'Enter your password.';
+      errorBox.classList.add('visible');
+      return;
+    }
+    submit.disabled = true;
+    submit.textContent = 'Generating…';
+    try {
+      const result = await call('auth:regenerateRecovery', [password]);
+      closeModal();
+      if (result && result.recoveryCode) showRecoveryKey(result.recoveryCode);
+    } catch (error) {
+      errorBox.textContent = error.message;
+      errorBox.classList.add('visible');
+      submit.disabled = false;
+      submit.textContent = 'Generate key';
+    }
+  });
+}
+
+async function lockNow() {
+  try {
+    await call('auth:lock', []);
+  } catch (error) {
+    showToast(error.message || 'Could not lock the app.', 'error');
+    return;
+  }
+  showLogin();
+  showToast('App locked.', 'success');
 }
 
 function openUnlinkAccountModal(accountId) {
@@ -1808,10 +2111,15 @@ function openAddAdminModal() {
   });
 }
 
+function safeQrData(value) {
+  if (typeof value !== 'string' || value.length > 300000) return null;
+  return /^data:image\/(?:png|jpeg);base64,[A-Za-z0-9+/=]+$/i.test(value) ? value : null;
+}
+
 function currentQrFor(accountId) {
   if (state.lastQr[accountId]) return state.lastQr[accountId];
   const account = state.accounts.find((item) => item.id === accountId);
-  return account && account.qr ? account.qr : null;
+  return account ? safeQrData(account.qr) : null;
 }
 
 function renderQrModal(title, description) {
@@ -1819,6 +2127,7 @@ function renderQrModal(title, description) {
   if (!pending) return;
   const account = state.accounts.find((item) => item.id === pending.accountId);
   const qr = currentQrFor(pending.accountId);
+  const qrMarkup = qr ? `<img src="${qr}" alt="WhatsApp pairing QR code">` : '';
   openModal(`
     <div class="modal-head">
       <div class="settings-icon">${icon('link', 22)}</div>
@@ -1826,7 +2135,7 @@ function renderQrModal(title, description) {
     </div>
     <div class="qr-wrap">
       <div class="qr-frame" id="qr-frame">
-        ${qr ? `<img src="${qr}" alt="WhatsApp pairing QR code">` : `<div class="qr-loading"><span class="spinner"></span><span id="qr-status-text">Waiting for WhatsApp…</span></div>`}
+        ${qrMarkup || `<div class="qr-loading"><span class="spinner"></span><span id="qr-status-text">Waiting for WhatsApp…</span></div>`}
       </div>
       <ol class="qr-steps">
         <li><span class="step-num">1</span> Open WhatsApp on your phone.</li>
@@ -1852,11 +2161,13 @@ function openExistingQr(accountId) {
 }
 
 function updateQrModal(payload) {
-  state.lastQr[payload.accountId] = payload.qr;
+  const qr = safeQrData(payload.qr);
+  if (!qr) return;
+  state.lastQr[payload.accountId] = qr;
   if (!state.pendingQr || state.pendingQr.accountId !== payload.accountId) return;
   const frame = document.getElementById('qr-frame');
   if (frame) {
-    frame.innerHTML = `<img src="${payload.qr}" alt="WhatsApp pairing QR code">`;
+    frame.innerHTML = `<img src="${qr}" alt="WhatsApp pairing QR code">`;
   }
 }
 
@@ -1981,6 +2292,9 @@ function subscribeEvents() {
   window.api.on('auth:changed', (payload) => {
     if (payload && payload.authenticated === false && state.auth) showLogin();
   });
+  window.api.on('auth:idleWarning', () => {
+    showToast('No activity detected. The app will lock in about two minutes.', 'info');
+  });
 }
 
 async function boot() {
@@ -1989,6 +2303,11 @@ async function boot() {
     const status = await call('auth:status', [], { silent: true });
     state.hasUser = status.hasUser;
     state.auth = status.authenticated;
+    state.user = status.username || null;
+    state.needsMigration = Boolean(status.needsMigration);
+    state.locked = Boolean(status.locked);
+    state.vaultMissing = Boolean(status.vaultMissing);
+    state.mustChangePassword = Boolean(status.mustChangePassword);
     state.dataDir = status.dataDir || '';
     if (status.authenticated) {
       await enterApp();

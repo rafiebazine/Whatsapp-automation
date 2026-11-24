@@ -30,7 +30,23 @@ const {
 } = require('./identity');
 const contactDiagnostics = require('./contact-diagnostics');
 
-const logger = pino({ level: process.env.WGM_LOG_LEVEL || 'silent' });
+const logger = pino({
+  level: process.env.WGM_LOG_LEVEL || 'silent',
+  redact: {
+    paths: [
+      'account.phoneNumber',
+      'account.whatsappJid',
+      'account.whatsappLid',
+      'contact.name',
+      'contact.jid',
+      'group.id',
+      '*.jid',
+      '*.lid',
+      '*.phoneNumber'
+    ],
+    censor: '[redacted]'
+  }
+});
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const CONTACT_SYNC_BATCH_SIZE = 250;
 const APP_STATE_CONTACT_COLLECTION = 'critical_unblock_low';
@@ -114,6 +130,20 @@ function actionError(code, message) {
   return error;
 }
 
+function accountSessionFolder(root, account) {
+  const accountId = String(account && account.id || '');
+  const folderName = String(account && account.authFolder || '');
+  if (!/^acc_[A-Za-z0-9-]{1,64}$/.test(accountId) || folderName !== accountId) {
+    throw actionError('unsafe_account', 'The account session folder is invalid. Re-link the account.');
+  }
+  const resolvedRoot = path.resolve(root);
+  const folder = path.resolve(resolvedRoot, folderName);
+  if (path.dirname(folder) !== resolvedRoot) {
+    throw actionError('unsafe_account', 'The account session folder is outside the sessions directory.');
+  }
+  return folder;
+}
+
 class SessionManager extends EventEmitter {
   constructor({ db, sessionsRoot }) {
     super();
@@ -190,7 +220,7 @@ class SessionManager extends EventEmitter {
       changed = true;
     }
     if (changed) {
-      console.info('[identity] account identity updated', identitySummary(account));
+      console.info('[identity] account identity updated', { accountId: account.id });
     }
     return changed;
   }
@@ -329,7 +359,7 @@ class SessionManager extends EventEmitter {
       this.reconnectTimers.delete(accountId);
     }
 
-    const folder = path.join(this.sessionsRoot, account.authFolder);
+    const folder = accountSessionFolder(this.sessionsRoot, account);
     let authState;
     try {
       authState = await useEncryptedAuthState(folder, this.masterKey, account.id);
@@ -685,7 +715,7 @@ class SessionManager extends EventEmitter {
     const account = this.db.findAccount(accountId);
     if (!account) throw new Error('Account not found.');
     await this.stopAccount(accountId);
-    const folder = path.join(this.sessionsRoot, account.authFolder);
+    const folder = accountSessionFolder(this.sessionsRoot, account);
     try {
       fs.rmSync(folder, { recursive: true, force: true });
     } catch (error) {
@@ -736,7 +766,7 @@ class SessionManager extends EventEmitter {
     const timer = this.reconnectTimers.get(accountId);
     if (timer) clearTimeout(timer);
     this.reconnectTimers.delete(accountId);
-    const folder = path.join(this.sessionsRoot, account.authFolder);
+    const folder = accountSessionFolder(this.sessionsRoot, account);
     try {
       fs.rmSync(folder, { recursive: true, force: true });
     } catch (error) {
@@ -1286,9 +1316,8 @@ class SessionManager extends EventEmitter {
       const me = matchingParticipants.find((participant) => participantIsAdmin(participant)) || matchingParticipants[0];
       if (!me && account) {
         console.info('[identity] connected account was not found in group participants', {
-          groupId: metadata.id,
           addressingMode: metadata.addressingMode,
-          account: identitySummary(account)
+          accountId: account.id
         });
       }
       for (const participant of participants) {

@@ -110,6 +110,15 @@ class QueueManager extends EventEmitter {
     }
   }
 
+  async pauseAndWait(timeoutMs = 5000) {
+    this.pause();
+    const startedAt = Date.now();
+    while (this.busy && Date.now() - startedAt < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return !this.busy;
+  }
+
   kick() {
     if (!this.running) return;
     this.tickSoon(250);
