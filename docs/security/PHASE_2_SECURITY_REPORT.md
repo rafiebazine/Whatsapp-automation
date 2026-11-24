@@ -8,16 +8,17 @@ The app now starts locked on a fresh install and writes the database directly in
 
 ## Verification evidence
 
-- Automated suite: 129/129 passing (`node --test "test/*.test.js"`).
-- Security-only suite: 29/29 passing (`node --test "test/security-*.test.js"`).
+- Automated suite: 155 tests, 154 passing, 1 skipped (`npm test`).
+- Security-only suite: 55 tests, 54 passing, 1 skipped (`npm run test:security`).
 - Syntax check of all application, script, and test files passed.
 - `npm ci --allow-git=all` succeeded; plain `npm ci` is blocked by the environment's git dependency policy.
 - `npm audit`: 0 vulnerabilities after pinning vulnerable build-tool `minimatch` versions to `11.0.1`.
 - Linux AppImage built with electron-builder `26.18.0`.
 - ASAR verified inside the packaged app.
 - Electron fuses verified: ASAR integrity and ASAR-only loading enabled; Node escape and file-protocol privilege fuses disabled.
-- Checksum generated: AppImage SHA-256 `d6ff174484f03f074087ab9fdad2bffae3acb62ec58fd09e7033ff0b422a0bf6`.
-- Signing status reports unsigned because no certificate variables are configured.
+- Checksum generated for `WhatsApp Group Manager-1.0.0-x86_64.AppImage`: SHA-256 `cfa11bbb9da6816fcfc706e18768db8a2391ce6bbb21c9914c65b519faeb1b28`.
+- Signing status reports unsigned because no certificate variables are configured; tagged CI releases fail closed without signing secrets.
+- Correctness audit and per-finding evidence: `CORRECTNESS_REPORT.md`.
 
 See `SECURITY_TESTS.md` for commands and detailed results.
 

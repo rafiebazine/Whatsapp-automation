@@ -95,6 +95,40 @@ class QueueManager extends EventEmitter {
     this.jobCursor = 0;
   }
 
+  saveOrThrow(context) {
+    if (typeof this.db.saveOrThrow === 'function') return this.db.saveOrThrow();
+    if (typeof this.db.save === 'function' && this.db.save() === false) {
+      const error = new Error('The local database could not be saved to disk.');
+      error.code = 'db_persist_failed';
+      throw error;
+    }
+    return true;
+  }
+
+  saveBestEffort(context) {
+    if (typeof this.db.saveBestEffort === 'function') return this.db.saveBestEffort(context);
+    if (typeof this.db.save === 'function') return this.db.save();
+    return true;
+  }
+
+  transaction(mutator, context) {
+    if (typeof this.db.transaction === 'function') return this.db.transaction(mutator, context);
+    const result = mutator(this.db.data);
+    const saved = typeof this.db.save === 'function' ? this.db.save() : true;
+    if (saved === false) {
+      const error = new Error('The local database could not be saved to disk.');
+      error.code = 'db_persist_failed';
+      throw error;
+    }
+    return result;
+  }
+
+  reportPersistenceError(error, context) {
+    if (typeof this.db.reportPersistenceError === 'function') {
+      this.db.reportPersistenceError(error, context);
+    }
+  }
+
   start() {
     if (this.running) return;
     this.running = true;
@@ -140,7 +174,7 @@ class QueueManager extends EventEmitter {
         changed = true;
       }
     }
-    if (changed) this.db.save();
+    if (changed) this.saveBestEffort('queue-reset-interrupted');
   }
 
   tickSoon(ms) {
@@ -309,7 +343,7 @@ class QueueManager extends EventEmitter {
       }
     }
     if (changed) {
-      this.db.save();
+      this.saveBestEffort('queue-blocked-reason');
       this.emitJobs();
     }
   }
@@ -368,16 +402,46 @@ class QueueManager extends EventEmitter {
     return Boolean(error && error.code === 'protected_admin_target');
   }
 
+  pauseAfterPersistenceFailure(error, context) {
+    this.pause();
+    this.reportPersistenceError(error, context);
+    this.emit('toast', {
+      type: 'error',
+      message: 'Changes could not be saved to disk. Background actions have been paused.'
+    });
+  }
+
   async execute(job, target, account, group) {
     const settings = this.getSettings();
     const today = this.db.todayKey();
+    const previous = {
+      targetStatus: target.status,
+      targetAttempts: target.attempts,
+      targetError: target.error,
+      targetAccountId: target.accountId,
+      jobStatus: job.status,
+      jobStartedAt: job.startedAt,
+      jobBlockedReason: job.blockedReason
+    };
     target.status = 'running';
     target.attempts = (target.attempts || 0) + 1;
     job.status = 'running';
     if (!job.startedAt) job.startedAt = new Date().toISOString();
     job.blockedReason = null;
     let localBlock = false;
-    this.db.save();
+    try {
+      this.saveOrThrow();
+    } catch (error) {
+      target.status = previous.targetStatus;
+      target.attempts = previous.targetAttempts;
+      target.error = previous.targetError;
+      target.accountId = previous.targetAccountId;
+      job.status = previous.jobStatus;
+      job.startedAt = previous.jobStartedAt;
+      job.blockedReason = previous.jobBlockedReason;
+      this.pauseAfterPersistenceFailure(error, 'queue-execute-start');
+      throw error;
+    }
     this.emitJobs();
 
     try {
@@ -489,7 +553,12 @@ class QueueManager extends EventEmitter {
     }
 
     this.updateJobState(job, group);
-    this.db.save();
+    try {
+      this.saveOrThrow();
+    } catch (error) {
+      this.pauseAfterPersistenceFailure(error, 'queue-execute-result');
+      throw error;
+    }
     this.emitJobs();
     this.emit('accounts:update');
     if (job.status !== 'running' && job.status !== 'queued') {
@@ -544,7 +613,7 @@ class QueueManager extends EventEmitter {
       if (!group.hasOngoingAction) {
         group.hasError = job.status === 'failed' || job.status === 'partial';
       }
-      this.db.save();
+      this.saveBestEffort('queue-finalize');
       this.emit('groups:update');
       this.sessions.refreshGroup(job.groupId).then(() => {
         this.emit('groups:update');
@@ -660,10 +729,12 @@ class QueueManager extends EventEmitter {
       blockedReason: null
     };
 
-    group.hasOngoingAction = true;
-    group.hasError = false;
-    this.db.data.jobs.push(job);
-    this.db.save();
+    this.transaction((data) => {
+      const targetGroup = data.groups.find((item) => item.id === group.id) || group;
+      targetGroup.hasOngoingAction = true;
+      targetGroup.hasError = false;
+      data.jobs.push(job);
+    }, 'queue-create-job');
     this.emitJobs();
     this.emit('groups:update');
     this.kick();
@@ -700,13 +771,15 @@ class QueueManager extends EventEmitter {
     const job = this.db.findJob(jobId);
     if (!job) throw new Error('Job not found.');
     if (ACTIVE_STATUSES.has(job.status)) throw new Error('An active job cannot be dismissed.');
-    job.dismissed = true;
-    this.db.save();
+    this.transaction((data) => {
+      const targetJob = data.jobs.find((item) => item.id === job.id);
+      if (targetJob) targetJob.dismissed = true;
+    }, 'queue-dismiss-job');
     this.emitJobs();
     return true;
   }
 
-  cancelJobsForGroup(groupId, reason) {
+  cancelJobsForGroup(groupId, reason, options = {}) {
     const jobs = this.db.data.jobs.filter(
       (job) => job.groupId === groupId && ACTIVE_STATUSES.has(job.status)
     );
@@ -740,10 +813,13 @@ class QueueManager extends EventEmitter {
         );
         group.hasError = true;
       }
-      this.db.save();
-      this.emitJobs();
-      this.emit('groups:update');
+      if (options.save !== false) this.saveOrThrow();
+      if (options.emit !== false) {
+        this.emitJobs();
+        this.emit('groups:update');
+      }
     }
+    return jobs.length;
   }
 
   emitJobs() {

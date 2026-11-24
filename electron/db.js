@@ -1,7 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { ensurePrivateDir, writeFileAtomicPrivate } = require('./secure-fs');
+const secureFs = require('./secure-fs');
+const { ensurePrivateDir, writeFileAtomicPrivate } = secureFs;
 const {
   normalizeJid,
   isPnJid,
@@ -139,8 +140,15 @@ function decryptDatabase(envelope, key) {
 }
 
 class Database {
-  constructor(filePath) {
+  constructor(filePath, options = {}) {
     this.filePath = filePath;
+    this.io = {
+      ensurePrivateDir: options.ensurePrivateDir || ensurePrivateDir,
+      writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate,
+      readFileSync: options.readFileSync || fs.readFileSync
+    };
+    this.persistenceErrorHandler = options.onPersistenceError || null;
+    this.lastPersistenceError = null;
     this.data = defaultData();
     this.mode = 'locked';
     this.encryptionKey = null;
@@ -159,11 +167,21 @@ class Database {
   }
 
   inspect() {
-    ensurePrivateDir(path.dirname(this.filePath));
+    this.io.ensurePrivateDir(path.dirname(this.filePath));
     if (!fs.existsSync(this.filePath)) return { kind: 'missing' };
-    const stat = fs.statSync(this.filePath);
+    const stat = fs.lstatSync(this.filePath);
+    if (stat.isSymbolicLink()) {
+      const error = new Error('The local database path is a symbolic link.');
+      error.code = 'db_unsafe_path';
+      throw error;
+    }
+    if (!stat.isFile()) {
+      const error = new Error('The local database path is not a regular file.');
+      error.code = 'db_unsafe_path';
+      throw error;
+    }
     if (stat.size > MAX_DB_BYTES) throw new Error('The local database file is too large.');
-    const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
+    const parsed = JSON.parse(this.io.readFileSync(this.filePath, 'utf8'));
     if (parsed && parsed.format === DB_FORMAT) {
       try {
         validateEnvelope(parsed);
@@ -177,11 +195,11 @@ class Database {
   }
 
   load() {
-    ensurePrivateDir(path.dirname(this.filePath));
+    this.io.ensurePrivateDir(path.dirname(this.filePath));
     if (!fs.existsSync(this.filePath)) {
       this.data = defaultData();
       this.mode = 'plaintext';
-      this.save();
+      this.saveOrThrow();
       this.rebuildContactIndex();
       return this.data;
     }
@@ -189,8 +207,11 @@ class Database {
     try {
       info = this.inspect();
     } catch (error) {
-      console.error('Failed to load local database:', error);
-      if (error.code === 'db_corrupt') throw error;
+      console.error('Failed to load local database.');
+      if (error.code === 'db_corrupt' || error.code === 'db_unsafe_path') throw error;
+      if (error && ['EACCES', 'EPERM', 'EIO', 'ENOSPC', 'EMFILE', 'ENFILE', 'EISDIR'].includes(error.code)) {
+        throw error;
+      }
       try {
         if (fs.existsSync(this.filePath)) {
           const backup = `${this.filePath}.corrupt-${Date.now()}`;
@@ -198,22 +219,20 @@ class Database {
           console.error(`Preserved unreadable database at ${backup}`);
         }
       } catch (backupError) {
-        console.error('Failed to preserve unreadable database:', backupError);
+        console.error('Failed to preserve unreadable database.');
       }
-      this.data = defaultData();
-      this.mode = 'plaintext';
-      this.save();
-      this.rebuildContactIndex();
-      return this.data;
+      const failure = new Error('The local database is unreadable and was not replaced.');
+      failure.code = 'db_corrupt';
+      throw failure;
     }
     if (info.kind === 'encrypted') {
       throw new Error('The local database is encrypted. Unlock it with the local security vault.');
     }
     this.data = info.data;
     this.mode = 'plaintext';
-    this.save();
+    this.saveOrThrow();
     this.rebuildContactIndex();
-    if (this.refreshCachedDisplayNames() > 0) this.save();
+    if (this.refreshCachedDisplayNames() > 0) this.saveOrThrow();
     return this.data;
   }
 
@@ -228,7 +247,7 @@ class Database {
     this.mode = 'encrypted';
     this.ensureSessionMasterKey();
     this.rebuildContactIndex();
-    if (this.refreshCachedDisplayNames() > 0) this.save();
+    if (this.refreshCachedDisplayNames() > 0) this.saveOrThrow();
     return this.data;
   }
 
@@ -239,7 +258,7 @@ class Database {
     this.mode = 'encrypted';
     this.ensureSessionMasterKey();
     this.rebuildContactIndex();
-    if (options.save !== false) this.save();
+    if (options.save !== false) this.saveOrThrow();
     return this.data;
   }
 
@@ -247,9 +266,89 @@ class Database {
     if (!this.data.security || typeof this.data.security !== 'object') this.data.security = {};
     if (!this.data.security.sessionMasterKey) {
       this.data.security.sessionMasterKey = crypto.randomBytes(32).toString('base64');
-      this.save();
+      this.saveOrThrow();
     }
     return this.data.security.sessionMasterKey;
+  }
+
+  setPersistenceErrorHandler(handler) {
+    this.persistenceErrorHandler = typeof handler === 'function' ? handler : null;
+  }
+
+  reportPersistenceError(error, context) {
+    if (this.persistenceErrorHandler) {
+      try {
+        this.persistenceErrorHandler(error, context || 'database');
+      } catch (handlerError) {
+        console.error('Persistence error handler failed.');
+      }
+    }
+  }
+
+  persistenceFailure(cause) {
+    const error = new Error('The local database could not be saved to disk.');
+    error.code = 'db_persist_failed';
+    error.cause = cause;
+    return error;
+  }
+
+  saveOrThrow() {
+    if (this.mode === 'locked') {
+      const error = new Error('The local database is locked.');
+      error.code = 'db_locked';
+      throw error;
+    }
+    try {
+      this.io.ensurePrivateDir(path.dirname(this.filePath));
+      if (this.mode === 'encrypted') {
+        if (!this.encryptionKey) throw new Error('The database is unlocked without an encryption key.');
+        this.io.writeFileAtomicPrivate(
+          this.filePath,
+          JSON.stringify(encryptDatabase(this.data, this.encryptionKey), null, 2)
+        );
+      } else {
+        this.io.writeFileAtomicPrivate(this.filePath, JSON.stringify(this.data, null, 2));
+      }
+      this.lastPersistenceError = null;
+      return true;
+    } catch (error) {
+      const failure = this.persistenceFailure(error);
+      this.lastPersistenceError = failure;
+      console.error('Failed to save local database.');
+      throw failure;
+    }
+  }
+
+  hasPersistenceError() {
+    return Boolean(this.lastPersistenceError);
+  }
+
+  saveBestEffort(context = 'database') {
+    try {
+      this.saveOrThrow();
+      return true;
+    } catch (error) {
+      this.reportPersistenceError(error, context);
+      return false;
+    }
+  }
+
+  transaction(mutator, context = 'database') {
+    if (typeof mutator !== 'function') throw new Error('A transaction mutator is required.');
+    const snapshot = structuredClone(this.data);
+    try {
+      const result = mutator(this.data);
+      if (result && typeof result.then === 'function') {
+        throw new Error('Database transactions must be synchronous.');
+      }
+      this.saveOrThrow();
+      return result;
+    } catch (error) {
+      this.data = snapshot;
+      this.rebuildContactIndex();
+      if (error && error.code === 'db_persist_failed') this.reportPersistenceError(error, context);
+      throw error;
+    }
   }
 
   lock() {
@@ -266,19 +365,7 @@ class Database {
 
   save() {
     if (this.mode === 'locked') return false;
-    try {
-      ensurePrivateDir(path.dirname(this.filePath));
-      if (this.mode === 'encrypted') {
-        if (!this.encryptionKey) throw new Error('The database is unlocked without an encryption key.');
-        writeFileAtomicPrivate(this.filePath, JSON.stringify(encryptDatabase(this.data, this.encryptionKey), null, 2));
-      } else {
-        writeFileAtomicPrivate(this.filePath, JSON.stringify(this.data, null, 2));
-      }
-      return true;
-    } catch (error) {
-      console.error('Failed to save local database:', error);
-      return false;
-    }
+    return this.saveBestEffort('database');
   }
 
   todayKey(date = new Date()) {
@@ -303,7 +390,7 @@ class Database {
         changed = true;
       }
     }
-    if (changed) this.save();
+    if (changed) this.saveBestEffort('daily-counters');
   }
 
   addAccount(alias) {
@@ -336,7 +423,12 @@ class Database {
       adminAccess: {}
     };
     this.data.accounts.push(account);
-    this.save();
+    try {
+      this.saveOrThrow();
+    } catch (error) {
+      this.data.accounts.pop();
+      throw error;
+    }
     return account;
   }
 

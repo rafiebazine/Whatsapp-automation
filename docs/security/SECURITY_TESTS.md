@@ -6,16 +6,16 @@
 - Baseline versions: Electron `33.4.11`, electron-builder `25.1.8`, `xlsx@0.18.5`
 - Baseline automated suite: 100/100 passing
 - Current versions: Electron `45.4.1`, electron-builder `26.18.0`, vendored `xlsx@0.20.3`
-- Current automated suite: 129/129 passing, including 29 security tests
+- Current automated suite: 155 tests, 154 passing, 1 skipped, including 55 security tests (54 pass, 1 skip)
 
 ## Automated commands and results
 
 ```bash
-node --test "test/*.test.js"
-# tests 129, pass 129, fail 0
+npm test
+# tests 155, pass 154, fail 0, skipped 1
 
-node --test "test/security-*.test.js"
-# tests 29, pass 29, fail 0
+npm run test:security
+# tests 55, pass 54, fail 0, skipped 1
 ```
 
 Security suites cover:
@@ -30,7 +30,12 @@ Security suites cover:
 - IPC schema and packaging/CSP/window configuration checks
 - fresh-install plaintext-write prevention and renderer snapshot secret-exclusion checks
 - XLSX ZIP bombs, CSV bounds, import row bounds, and contact-name sanitization
-- private filesystem modes and atomic write behavior
+- private filesystem modes, atomic write cleanup, symlink rejection, and permission-failure propagation
+- database write/transaction rollback, non-corruption read fail-closed behavior, and auth-state failure injection
+- queue pre-send persistence abort and job rollback
+- Windows ACL fail-closed behavior (native Windows check skipped on Linux)
+- signing status, unsigned/unverified artifact reporting, and certificate non-disclosure
+- legacy migration rollback of database and session re-encryption
 - diagnostic identifier/name redaction and friendly-error identity stripping
 - renderer static safety checks for dynamic code execution, QR validation, and escaping
 
@@ -81,16 +86,17 @@ Results:
 - ASAR enabled; `electron/main.js`, `electron/vault.js`, `electron/secure-fs.js`, `electron/db.js`, and `src/index.html` are inside `app.asar`.
 - Fuses verified: `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNodeCliInspectArguments`, `LoadBrowserProcessSpecificV8Snapshot`, and `GrantFileProtocolExtraPrivileges` disabled; `EnableEmbeddedAsarIntegrityValidation` and `OnlyLoadAppFromAsar` enabled.
 - `npm run signing:status` reports unsigned because no certificate variables are configured.
-- Final AppImage SHA-256: `d6ff174484f03f074087ab9fdad2bffae3acb62ec58fd09e7033ff0b422a0bf6`
+- `node scripts/verify-artifacts.js` reports the AppImage as unsigned and Windows executables as unverified off Windows.
+- Final AppImage (`WhatsApp Group Manager-1.0.0-x86_64.AppImage`) SHA-256: `cfa11bbb9da6816fcfc706e18768db8a2391ce6bbb21c9914c65b519faeb1b28`
 
 ## Manual checks requiring operator or environment
 
 Not performed in this environment:
 
 - Real WhatsApp QR linking, send/remove actions, relink, and unlink without user accounts
-- Windows installer, Windows ACL enforcement, Windows runtime, and SmartScreen behavior
 - Interactive smoke test of setup, login, lock, recovery, import, and restart with a graphical session
-- Code signing and signed-artifact verification without certificates
+- Native Windows ACL enforcement, installer, runtime, SmartScreen, and Authenticode verification without a Windows runner and certificate
+- Tagged signed release verification requires `WIN_CSC_LINK`/`WIN_CSC_KEY_PASSWORD` in protected CI secrets
 
 Recommended operator smoke tests are in `USER_GUIDE_AND_E2E_TEST_PLAN.md`, especially T01, T02, T19, and T21.
 

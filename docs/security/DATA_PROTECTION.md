@@ -26,7 +26,9 @@ A fresh app start does not create a plaintext database. Until setup succeeds, th
 5. An encrypted `.migrated-*.enc` copy is written after the new database is verified.
 6. Accounts that fail re-encryption are marked `needsRelink`; the app does not silently discard them.
 
-A failed migration leaves the plaintext database and the new vault in place so the operator can retry. There is no plaintext migration backup.
+A failed migration leaves the plaintext database and the new vault in place so the operator can retry. If session re-encryption already occurred, the migration attempts to re-encrypt those session folders back to the old key before restoring the in-memory database snapshot. There is no plaintext migration backup.
+
+Database, vault, and auth-state writes are transactional at the application level. A write failure does not silently report success: transactions restore in-memory state, queue execution persists `running` state before sending, and credential-write failure marks the account `needsRelink` and closes its socket. Atomic writes use a private temporary file and rename; a failed rename removes the temporary file and preserves the previous file.
 
 ## Backup and restore
 
@@ -39,6 +41,7 @@ A failed migration leaves the plaintext database and the new vault in place so t
 
 - Lock and logout clear the DEK, session master key, sockets, and queue from memory. They do not delete files.
 - Deleting the data folder removes the vault, database, sessions, diagnostics, and logs. Accounts must be re-linked.
+- Account removal moves session folders to `.deleting-*` tombstones before the database write. A failed removal restores the folder; stale tombstones are deleted on the next boot.
 - Deleting only the database or only the vault can make remaining data unrecoverable. Delete the whole folder when intentionally resetting.
 
 ## Diagnostic opt-ins

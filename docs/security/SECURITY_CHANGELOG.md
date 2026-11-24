@@ -1,5 +1,16 @@
 # Security Changelog — Phase 2
 
+## Correctness remediation (audit of `995acf9`)
+
+- Auth-state persistence now rejects on failure, serializes writes, retries transient file errors, marks the account `needsRelink`, and closes the socket on terminal credential-write failure. Database-only identity failures are reported without forcing a relink.
+- Database writes now expose `saveOrThrow`, `saveBestEffort`, and transactional rollback; queue execution persists intent before sending and pauses on persistence failure instead of silently continuing.
+- Vault create/change/reset/regenerate and lockout writes are copy-on-write and roll back memory on failure. An unpersistable lockout fails closed.
+- Windows ACL hardening is fail-closed and verified for inherited entries and full control; atomic-write temp files are cleaned after failed renames; target symlinks are rejected.
+- Account, group, settings, contact-import, and job mutations use transactions and session-folder tombstones. Legacy migration rolls back the database snapshot and session re-encryption when encryption cannot be saved and verified.
+- `Database.load()` fails closed on unreadable plaintext data and preserves a `.corrupt-*` copy instead of replacing it.
+- IPC binary payload limits now account for `ArrayBuffer` and typed-array bytes; XLSX preflight validates ZIP64 sentinels, local headers, size agreement, and entry bounds.
+- Added Windows/Linux security CI, release signing configuration, artifact verification scripts, and required-signed tagged releases.
+
 ## Authentication and encryption
 
 - Added `electron/vault.js` with a random database key, scrypt password and recovery key wraps, bcrypt verifier, persisted KDF parameters, and escalating lockout.

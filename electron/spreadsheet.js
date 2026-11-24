@@ -49,7 +49,11 @@ function preflightXlsxZip(buffer) {
     const nameLength = buffer.readUInt16LE(offset + 28);
     const extraLength = buffer.readUInt16LE(offset + 30);
     const commentLength = buffer.readUInt16LE(offset + 32);
+    const localOffset = buffer.readUInt32LE(offset + 42);
     if (flags & 0x1) throw new Error('Encrypted spreadsheet archives are not supported.');
+    if (compressed === 0xffffffff || uncompressed === 0xffffffff || localOffset === 0xffffffff) {
+      throw new Error('ZIP64 spreadsheets are not supported.');
+    }
     if (uncompressed > MAX_ZIP_ENTRY) throw new Error('The spreadsheet archive contains an oversized entry.');
     if (compressed > 0 && uncompressed / compressed > MAX_ZIP_RATIO) {
       throw new Error('The spreadsheet archive is compressed too aggressively.');
@@ -69,6 +73,26 @@ function preflightXlsxZip(buffer) {
       name.split(/[\\/]/).some((part) => part === '..')
     ) {
       throw new Error('The spreadsheet archive contains an unsafe path.');
+    }
+    if (localOffset + 30 > buffer.length || buffer.readUInt32LE(localOffset) !== 0x04034b50) {
+      throw new Error('The spreadsheet archive has a corrupt local header.');
+    }
+    const localFlags = buffer.readUInt16LE(localOffset + 6);
+    const localCompressed = buffer.readUInt32LE(localOffset + 18);
+    const localUncompressed = buffer.readUInt32LE(localOffset + 22);
+    const localNameLength = buffer.readUInt16LE(localOffset + 26);
+    const localExtraLength = buffer.readUInt16LE(localOffset + 28);
+    if (localCompressed === 0xffffffff || localUncompressed === 0xffffffff) {
+      throw new Error('ZIP64 spreadsheets are not supported.');
+    }
+    if (localOffset + 30 + localNameLength + localExtraLength > buffer.length) {
+      throw new Error('The spreadsheet archive has a corrupt local header.');
+    }
+    if (!(localFlags & 0x8) && localCompressed !== compressed) {
+      throw new Error('The spreadsheet archive local header does not match the central directory.');
+    }
+    if (localOffset + 30 + localNameLength + localExtraLength + compressed > buffer.length) {
+      throw new Error('The spreadsheet archive entry extends beyond the file.');
     }
     offset += 46 + nameLength + extraLength + commentLength;
   }

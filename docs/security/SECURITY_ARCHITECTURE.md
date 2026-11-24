@@ -22,10 +22,11 @@ Out of scope:
 ## Trust boundaries
 
 1. **Renderer → main process.** The renderer is treated as untrusted. It can only call whitelisted preload channels. The main process validates the sender frame, local URL, argument count, argument types, payload size, rate, authentication state, and recent-authentication requirement before running a handler.
-2. **Main process → filesystem.** All sensitive writes go through `electron/secure-fs.js`: private directories (`0700`), private files (`0600`), atomic temporary-file plus rename writes, fsync, and best-effort Windows ACL restrictions.
+2. **Main process → filesystem.** All sensitive writes go through `electron/secure-fs.js`: private directories (`0700`), private files (`0600`), atomic temporary-file plus rename writes, fsync, temporary-file cleanup, target-symlink rejection, and fail-closed Windows ACL restrictions verified with `icacls`.
 3. **Main process → WhatsApp.** Baileys runs only in the main process. Session credentials are decrypted in memory only while unlocked.
 4. **Imported files → application.** Spreadsheet and CSV input is bounded before parsing. XLSX ZIP containers are rejected when they are encrypted, ZIP64, path-unsafe, oversized, or excessively compressed.
 5. **Logs and diagnostics → operator.** Normal logs are silent and identifiers are redacted. Full names and raw identities require explicit environment opt-ins.
+6. **Persistence failures → operator.** Database, vault, and auth-state writes fail closed. In-memory mutations are rolled back in transactions, queue actions persist intent before sending, and unrecoverable write failures pause background work and surface a generic retry message.
 
 ## Authentication and key hierarchy
 
@@ -72,4 +73,6 @@ The product is a single-operator desktop app. Contacts and group metadata are in
 - The packaged artifacts are unsigned.
 - Real WhatsApp sends, QR linking, and relinking were not exercised without user accounts.
 - The database and vault are only as strong as the operator's password and recovery-key handling.
+- A post-send persistence failure cannot undo the external WhatsApp action; the queue pauses and the operator must verify group membership after a disk failure.
+- CI can run Windows tests, but native ACL enforcement and Authenticode verification still require a real Windows runner and configured certificate secrets.
 - Electron and SheetJS are third-party dependencies; this work reduces but does not eliminate supply-chain risk.

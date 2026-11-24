@@ -141,8 +141,19 @@ class AuthVault {
     this.filePath = filePath;
     this.scryptN = Number(options.scryptN) || DEFAULT_SCRYPT.N;
     this.bcryptRounds = Number(options.bcryptRounds) || DEFAULT_BCRYPT_ROUNDS;
+    this.writeFile = options.writeFile || ((file, data) => writeFileAtomicPrivate(file, data));
     this.state = null;
     this.dek = null;
+  }
+
+  persistState(state) {
+    try {
+      this.writeFile(this.filePath, JSON.stringify(state, null, 2));
+    } catch (error) {
+      const failure = vaultError('vault_persist_failed', 'The local security settings could not be saved to disk.');
+      failure.cause = error;
+      throw failure;
+    }
   }
 
   load() {
@@ -150,7 +161,13 @@ class AuthVault {
       this.state = null;
       return null;
     }
-    const parsed = JSON.parse(readFilePrivate(this.filePath));
+    let parsed;
+    try {
+      parsed = JSON.parse(readFilePrivate(this.filePath, 'utf8', { maxBytes: 1024 * 1024 }));
+    } catch (error) {
+      if (error && error.code === 'vault_corrupt') throw error;
+      throw vaultError('vault_corrupt', 'The local security file could not be read.');
+    }
     this.state = validateVault(parsed);
     return this.state;
   }
@@ -193,7 +210,7 @@ class AuthVault {
       p: DEFAULT_SCRYPT.p,
       keylen: DEFAULT_SCRYPT.keylen
     };
-    this.state = {
+    const nextState = {
       format: VAULT_FORMAT,
       version: VAULT_VERSION,
       username: cleanUser,
@@ -214,8 +231,9 @@ class AuthVault {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
+    this.persistState(nextState);
+    this.state = nextState;
     this.dek = Buffer.from(dek);
-    this.write();
     return { dek: Buffer.from(dek), recoveryCode: recovery };
   }
 
@@ -230,6 +248,7 @@ class AuthVault {
 
   recordFailure(kind = 'password') {
     const security = this.state.security;
+    const previous = { ...security };
     const recovery = kind === 'recovery';
     const countKey = recovery ? 'recoveryFailedAttempts' : 'failedAttempts';
     const lastKey = recovery ? 'recoveryLastFailedAt' : 'lastFailedAt';
@@ -240,11 +259,17 @@ class AuthVault {
       const step = Math.min(security[countKey] - LOCK_THRESHOLD, LOCK_STEPS_MS.length - 1);
       security[lockKey] = Math.max(security[lockKey] || 0, Date.now() + LOCK_STEPS_MS[step]);
     }
-    this.write();
+    try {
+      this.persistState(this.state);
+    } catch (error) {
+      this.state.security = previous;
+      throw error;
+    }
   }
 
   resetFailures(kind = 'password') {
     const security = this.state.security;
+    const previous = { ...security };
     if (kind === 'recovery') {
       security.recoveryFailedAttempts = 0;
       security.recoveryLastFailedAt = 0;
@@ -254,7 +279,12 @@ class AuthVault {
       security.lastFailedAt = 0;
       security.lockedUntil = 0;
     }
-    this.write();
+    try {
+      this.persistState(this.state);
+    } catch (error) {
+      this.state.security = previous;
+      throw error;
+    }
   }
 
   verifyPassword(username, password) {
@@ -290,7 +320,12 @@ class AuthVault {
       this.recordFailure('recovery');
       throw error;
     }
-    this.resetFailures('recovery');
+    try {
+      this.resetFailures('recovery');
+    } catch (error) {
+      this.dek = null;
+      throw error;
+    }
     return { dek: Buffer.from(this.dek) };
   }
 
@@ -316,53 +351,66 @@ class AuthVault {
       p: DEFAULT_SCRYPT.p,
       keylen: DEFAULT_SCRYPT.keylen
     };
-    this.state.passwordHash = bcrypt.hashSync(newPassword, this.bcryptRounds);
-    this.state.passwordKdf = passwordKdf;
-    this.state.passwordWrap = wrapKey(deriveKek(newPassword, passwordKdf), this.dek, aadFor('password', this.state.username));
-    this.state.recoveryKdf = recoveryKdf;
-    this.state.recoveryWrap = wrapKey(
-      deriveKek(normalizedRecovery, recoveryKdf),
-      this.dek,
-      aadFor('recovery', this.state.username)
-    );
-    this.state.updatedAt = new Date().toISOString();
-    this.write();
+    const nextState = {
+      ...this.state,
+      passwordHash: bcrypt.hashSync(newPassword, this.bcryptRounds),
+      passwordKdf,
+      passwordWrap: wrapKey(deriveKek(newPassword, passwordKdf), this.dek, aadFor('password', this.state.username)),
+      recoveryKdf,
+      recoveryWrap: wrapKey(
+        deriveKek(normalizedRecovery, recoveryKdf),
+        this.dek,
+        aadFor('recovery', this.state.username)
+      ),
+      updatedAt: new Date().toISOString()
+    };
+    this.persistState(nextState);
+    this.state = nextState;
     return { recoveryCode, dek: Buffer.from(this.dek) };
   }
 
   resetWithRecovery(code, newPassword) {
     const { dek } = this.unlockWithRecovery(code);
-    validatePassword(newPassword);
-    const passwordKdf = {
-      name: 'scrypt',
-      salt: crypto.randomBytes(16).toString('hex'),
-      N: this.scryptN,
-      r: DEFAULT_SCRYPT.r,
-      p: DEFAULT_SCRYPT.p,
-      keylen: DEFAULT_SCRYPT.keylen
-    };
-    const recoveryCode = generateRecoveryCode();
-    const normalizedRecovery = normalizeRecoveryCode(recoveryCode);
-    const recoveryKdf = {
-      name: 'scrypt',
-      salt: crypto.randomBytes(16).toString('hex'),
-      N: this.scryptN,
-      r: DEFAULT_SCRYPT.r,
-      p: DEFAULT_SCRYPT.p,
-      keylen: DEFAULT_SCRYPT.keylen
-    };
-    this.state.passwordHash = bcrypt.hashSync(newPassword, this.bcryptRounds);
-    this.state.passwordKdf = passwordKdf;
-    this.state.passwordWrap = wrapKey(deriveKek(newPassword, passwordKdf), dek, aadFor('password', this.state.username));
-    this.state.recoveryKdf = recoveryKdf;
-    this.state.recoveryWrap = wrapKey(
-      deriveKek(normalizedRecovery, recoveryKdf),
-      dek,
-      aadFor('recovery', this.state.username)
-    );
-    this.state.updatedAt = new Date().toISOString();
-    this.write();
-    return { recoveryCode, dek: Buffer.from(dek) };
+    try {
+      validatePassword(newPassword);
+      const passwordKdf = {
+        name: 'scrypt',
+        salt: crypto.randomBytes(16).toString('hex'),
+        N: this.scryptN,
+        r: DEFAULT_SCRYPT.r,
+        p: DEFAULT_SCRYPT.p,
+        keylen: DEFAULT_SCRYPT.keylen
+      };
+      const recoveryCode = generateRecoveryCode();
+      const normalizedRecovery = normalizeRecoveryCode(recoveryCode);
+      const recoveryKdf = {
+        name: 'scrypt',
+        salt: crypto.randomBytes(16).toString('hex'),
+        N: this.scryptN,
+        r: DEFAULT_SCRYPT.r,
+        p: DEFAULT_SCRYPT.p,
+        keylen: DEFAULT_SCRYPT.keylen
+      };
+      const nextState = {
+        ...this.state,
+        passwordHash: bcrypt.hashSync(newPassword, this.bcryptRounds),
+        passwordKdf,
+        passwordWrap: wrapKey(deriveKek(newPassword, passwordKdf), dek, aadFor('password', this.state.username)),
+        recoveryKdf,
+        recoveryWrap: wrapKey(
+          deriveKek(normalizedRecovery, recoveryKdf),
+          dek,
+          aadFor('recovery', this.state.username)
+        ),
+        updatedAt: new Date().toISOString()
+      };
+      this.persistState(nextState);
+      this.state = nextState;
+      return { recoveryCode, dek: Buffer.from(dek) };
+    } catch (error) {
+      this.dek = null;
+      throw error;
+    }
   }
 
   regenerateRecovery(password) {
@@ -378,20 +426,24 @@ class AuthVault {
       p: DEFAULT_SCRYPT.p,
       keylen: DEFAULT_SCRYPT.keylen
     };
-    this.state.recoveryKdf = recoveryKdf;
-    this.state.recoveryWrap = wrapKey(
-      deriveKek(normalizedRecovery, recoveryKdf),
-      this.dek,
-      aadFor('recovery', this.state.username)
-    );
-    this.state.updatedAt = new Date().toISOString();
-    this.write();
+    const nextState = {
+      ...this.state,
+      recoveryKdf,
+      recoveryWrap: wrapKey(
+        deriveKek(normalizedRecovery, recoveryKdf),
+        this.dek,
+        aadFor('recovery', this.state.username)
+      ),
+      updatedAt: new Date().toISOString()
+    };
+    this.persistState(nextState);
+    this.state = nextState;
     return { recoveryCode };
   }
 
   write() {
     ensurePrivateDir(path.dirname(this.filePath));
-    writeFileAtomicPrivate(this.filePath, JSON.stringify(this.state, null, 2));
+    this.persistState(this.state);
   }
 
   lock() {

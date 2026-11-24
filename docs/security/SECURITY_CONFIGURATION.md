@@ -10,7 +10,7 @@
 | Auth IPC rate limit | 20 requests/minute per channel | Excess returns `rate_limited` |
 | Other IPC rate limit | 180 requests/minute per channel | Excess returns `rate_limited` |
 | IPC argument limit | 6 arguments | Rejected before handler |
-| IPC payload limit | 16 MiB | Serialized argument size |
+| IPC payload limit | 16 MiB | UTF-8 strings, binary views/ArrayBuffers, and serialized objects |
 
 ## Import limits
 
@@ -33,10 +33,14 @@ CSV rows are preflighted, and contact import rows are limited to 10 keys and 1,0
 - Electron `45.4.1`, electron-builder `26.18.0`
 - ASAR enabled
 - Fuses configured in `scripts/after-pack.js`
-- Windows targets: NSIS and portable
+- Windows targets: NSIS and portable, with `signtoolOptions.signingHashAlgorithms: ["sha256"]`
 - Linux target: AppImage
 - `npm run checksums` writes a `.sha256` sidecar for every file in `dist/`
 - `npm run signing:status` reports whether certificate environment variables are configured without printing their values
+- `npm run verify:artifacts` reports Authenticode status on Windows and explicit unsigned status for AppImages
+- `npm run release:verify` exits nonzero when a Windows artifact is not validly signed
+- `.github/workflows/security-ci.yml` runs tests and audit on Ubuntu and Windows
+- `.github/workflows/release.yml` builds both platforms; tagged releases require `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD` and fail closed if they are absent
 
 Verify a packaged build:
 
@@ -52,9 +56,17 @@ Expected fuses: `RunAsNode`, `EnableNodeOptionsEnvironmentVariable`, `EnableNode
 
 `package.json` pins vulnerable build-tool `minimatch@9.0.9` and `minimatch@10.2.6` to `11.0.1`. These are development/build dependencies only and are not included in the shipped application runtime.
 
+## Persistence failure behavior
+
+- Database, vault, and auth-state write failures raise `db_persist_failed`, `vault_persist_failed`, or `auth_persist_failed`.
+- IPC returns a generic retry message for these codes and does not expose local paths or certificate values.
+- Queue execution persists `running` state before sending. Post-send persistence failures pause the queue and surface an error; the external WhatsApp action is not undone.
+- Auth-state writes retry transient file errors three times, then mark the account `needsRelink` and close its socket.
+- Windows ACL failures, including inherited entries or unverifiable full control, are fatal for the write rather than best-effort.
+
 ## Signing
 
-No code-signing certificates are configured. Windows artifacts will be unsigned, and Linux AppImages are not GPG-signed. Distribute checksums through a trusted channel and rebuild from reviewed source when possible.
+No code-signing certificates are configured in this repository. Local Windows artifacts will be unsigned, and Linux AppImages are not Authenticode-signed. Tagged releases require protected CI secrets `WIN_CSC_LINK` and `WIN_CSC_KEY_PASSWORD`; the release workflow refuses a tagged unsigned build. Manual development builds may be explicitly unsigned. Distribute checksums through a trusted channel and rebuild from reviewed source when possible.
 
 ## Linux sandbox note
 

@@ -15,7 +15,11 @@
     "build:linux": "electron-builder --linux AppImage",
     "dist:linux": "electron-builder --linux AppImage",
     "checksums": "node scripts/checksums.js",
-    "signing:status": "node scripts/signing-status.js"
+    "signing:status": "node scripts/signing-status.js",
+    "test:security": "node --test \"test/security-*.test.js\"",
+    "verify:artifacts": "node scripts/verify-artifacts.js",
+    "release:verify": "node scripts/verify-artifacts.js --require-signed",
+    "build:win": "electron-builder --win"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.24",
@@ -55,7 +59,12 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "signtoolOptions": {
+        "signingHashAlgorithms": [
+          "sha256"
+        ]
+      }
     },
     "nsis": {
       "oneClick": false,
@@ -71,7 +80,8 @@
             "x64"
           ]
         }
-      ]
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
     }
   },
   "overrides": {

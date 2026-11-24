@@ -2,7 +2,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { loadBaileys } = require('./baileys-loader');
-const { ensurePrivateDir, writeFileAtomicPrivate } = require('./secure-fs');
+const secureFs = require('./secure-fs');
+const { ensurePrivateDir, writeFileAtomicPrivate } = secureFs;
 
 const AUTH_FORMAT_VERSION = 2;
 
@@ -47,13 +48,41 @@ function authKey(masterKey, accountId) {
 
 async function readAuthState(file, masterKey, accountId, bufferJson) {
   if (!fs.existsSync(file)) return null;
-  const payload = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const raw = secureFs.readFilePrivate(file, 'utf8', { maxBytes: 16 * 1024 * 1024 });
+  const payload = JSON.parse(raw);
   return decryptJson(payload, authKey(masterKey, accountId), bufferJson, accountId);
 }
 
-async function useEncryptedAuthState(folder, masterKey, accountId) {
-  const { initAuthCreds, proto, BufferJSON } = await loadBaileys();
-  ensurePrivateDir(folder);
+const RETRYABLE_WRITE_CODES = new Set(['EACCES', 'EPERM', 'EBUSY', 'EAGAIN', 'ENOSPC', 'EIO', 'EMFILE', 'ENFILE']);
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function retryableWriteFailure(error) {
+  let current = error;
+  for (let depth = 0; current && depth < 4; depth += 1) {
+    if (RETRYABLE_WRITE_CODES.has(current.code)) return true;
+    current = current.cause;
+  }
+  return false;
+}
+
+function persistenceFailure(cause) {
+  const error = new Error('The encrypted session state could not be saved to disk.');
+  error.code = 'auth_persist_failed';
+  error.cause = cause;
+  return error;
+}
+
+async function useEncryptedAuthState(folder, masterKey, accountId, options = {}) {
+  const io = {
+    ensurePrivateDir: options.ensurePrivateDir || ensurePrivateDir,
+    writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate,
+    loadBaileys: options.loadBaileys || loadBaileys,
+    encryptJson: options.encryptJson || encryptJson,
+    retries: Number.isInteger(options.retries) ? options.retries : 3,
+    retryDelayMs: Number.isFinite(options.retryDelayMs) ? options.retryDelayMs : 200
+  };
+  const { initAuthCreds, proto, BufferJSON } = await io.loadBaileys();
+  io.ensurePrivateDir(folder);
   const file = path.join(folder, 'auth.enc');
   const key = authKey(masterKey, accountId);
 
@@ -67,13 +96,24 @@ async function useEncryptedAuthState(folder, masterKey, accountId) {
 
   let writeChain = Promise.resolve();
   const persist = () => {
-    writeChain = writeChain.then(async () => {
-      ensurePrivateDir(folder);
-      writeFileAtomicPrivate(file, JSON.stringify(encryptJson(state, key, BufferJSON, accountId)));
-    }).catch((error) => {
-      console.error('Failed to persist encrypted auth state:', error);
+    const run = writeChain.then(async () => {
+      let lastFailure = null;
+      for (let attempt = 0; attempt <= io.retries; attempt += 1) {
+        try {
+          io.ensurePrivateDir(folder);
+          const payload = io.encryptJson(state, key, BufferJSON, accountId);
+          io.writeFileAtomicPrivate(file, JSON.stringify(payload));
+          return;
+        } catch (error) {
+          lastFailure = error;
+          if (attempt >= io.retries || !retryableWriteFailure(error)) break;
+          await sleep(io.retryDelayMs * (attempt + 1));
+        }
+      }
+      throw persistenceFailure(lastFailure);
     });
-    return writeChain;
+    writeChain = run.catch(() => {});
+    return run;
   };
 
   await persist();
@@ -113,14 +153,22 @@ async function useEncryptedAuthState(folder, masterKey, accountId) {
   };
 }
 
-async function migrateEncryptedAuthState(folder, oldMasterKey, newMasterKey, accountId) {
+async function migrateEncryptedAuthState(folder, oldMasterKey, newMasterKey, accountId, options = {}) {
+  const io = {
+    loadBaileys: options.loadBaileys || loadBaileys,
+    writeFileAtomicPrivate: options.writeFileAtomicPrivate || writeFileAtomicPrivate
+  };
   const file = path.join(folder, 'auth.enc');
   if (!fs.existsSync(file)) return false;
-  const { BufferJSON } = await loadBaileys();
+  const { BufferJSON } = await io.loadBaileys();
   const state = await readAuthState(file, oldMasterKey, accountId, BufferJSON);
   if (!state) return false;
   const key = authKey(newMasterKey, accountId);
-  writeFileAtomicPrivate(file, JSON.stringify(encryptJson(state, key, BufferJSON, accountId)));
+  try {
+    io.writeFileAtomicPrivate(file, JSON.stringify(encryptJson(state, key, BufferJSON, accountId)));
+  } catch (error) {
+    throw persistenceFailure(error);
+  }
   return true;
 }
 

@@ -62,7 +62,7 @@ test('legacy migration encrypts the database and re-encrypts session credentials
     const dek = crypto.randomBytes(32);
     const result = await encryptLegacyDatabase({ db, filePath, dek, oldKey, sessionsRoot });
 
-    assert.deepEqual(result, { migrated: 1, relink: 0 });
+    assert.deepEqual(result, { migrated: 1, relink: 0, migratedAccountIds: ['acc_1'] });
     assert.equal(db.data.auth, null);
     assert.equal(db.data.security.sessionMasterKey.length, 44);
     assert.equal(db.data.accounts[0].needsRelink, undefined);
@@ -90,9 +90,52 @@ test('legacy migration marks accounts for relinking when no legacy session exist
     const sessionsRoot = path.join(dir, 'sessions');
     const oldKey = deriveLegacyKey('legacy password', db.data.auth.kdfSalt);
     const result = await encryptLegacyDatabase({ db, filePath, dek: crypto.randomBytes(32), oldKey, sessionsRoot });
-    assert.deepEqual(result, { migrated: 0, relink: 1 });
+    assert.deepEqual(result, { migrated: 0, relink: 1, migratedAccountIds: [] });
     assert.equal(db.data.accounts[0].needsRelink, true);
     assert.match(db.data.accounts[0].lastError, /no legacy session/);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test('legacy migration rolls back session re-encryption when the database cannot be saved', async () => {
+  const dir = tempDir();
+  try {
+    const { db, filePath } = legacyDatabase(dir);
+    const sessionsRoot = path.join(dir, 'sessions');
+    const oldKey = deriveLegacyKey('legacy password', db.data.auth.kdfSalt);
+    const legacyValue = { creds: { registrationId: 321 }, keys: { preKey: { a: { private: 'y' } } } };
+    const legacyKey = authStorePrivate.authKey(oldKey, 'acc_1');
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', legacyKey, iv);
+    const ciphertext = Buffer.concat([cipher.update(Buffer.from(JSON.stringify(legacyValue))), cipher.final()]);
+    writeFileAtomicPrivate(path.join(sessionsRoot, 'acc_1', 'auth.enc'), JSON.stringify({
+      version: 1,
+      iv: iv.toString('base64'),
+      tag: cipher.getAuthTag().toString('base64'),
+      data: ciphertext.toString('base64')
+    }));
+
+    let failEncrypted = true;
+    db.io.writeFileAtomicPrivate = (target, data) => {
+      if (failEncrypted && String(data).includes('wgm-encrypted-db')) {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      }
+      return writeFileAtomicPrivate(target, data);
+    };
+    await assert.rejects(
+      () => encryptLegacyDatabase({ db, filePath, dek: crypto.randomBytes(32), oldKey, sessionsRoot }),
+      (error) => error.code === 'db_persist_failed'
+    );
+    assert.equal(db.mode, 'plaintext');
+    assert.equal(db.data.auth.username, 'operator');
+    assert.equal(fs.existsSync(filePath), true);
+    assert.match(fs.readFileSync(filePath, 'utf8'), /legacy-hash/);
+
+    failEncrypted = false;
+    const restored = await useEncryptedAuthState(path.join(sessionsRoot, 'acc_1'), oldKey, 'acc_1');
+    assert.equal(restored.state.creds.registrationId, 321);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(sessionsRoot, 'acc_1', 'auth.enc'), 'utf8')).version, 2);
   } finally {
     cleanup(dir);
   }

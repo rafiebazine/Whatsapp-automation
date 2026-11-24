@@ -64,3 +64,22 @@ test('browser window enforces sandbox and packaged-only devtools', () => {
   assert.match(main, /setPermissionRequestHandler/);
   assert.match(main, /will-attach-webview/);
 });
+
+test('CI and signing configuration fail closed for tagged releases', () => {
+  const pkg = JSON.parse(read('package.json'));
+  assert.equal(pkg.scripts['release:verify'], 'node scripts/verify-artifacts.js --require-signed');
+  assert.equal(pkg.scripts['verify:artifacts'], 'node scripts/verify-artifacts.js');
+  assert.deepEqual(pkg.build.win.signtoolOptions.signingHashAlgorithms, ['sha256']);
+  const ci = read('.github/workflows/security-ci.yml');
+  const release = read('.github/workflows/release.yml');
+  assert.match(ci, /ubuntu-latest/);
+  assert.match(ci, /windows-latest/);
+  assert.match(ci, /npm test/);
+  assert.match(release, /--require-signed/);
+  assert.match(release, /WIN_CSC_LINK/);
+  assert.match(release, /exit 1/);
+  const ignore = read('.gitignore');
+  for (const pattern of ['*.p12', '*.pfx', '*.pem', '*.key']) {
+    assert.ok(ignore.includes(pattern), `missing ${pattern}`);
+  }
+});

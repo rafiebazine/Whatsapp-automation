@@ -97,33 +97,41 @@ function broadcast(channel, payload) {
 }
 
 async function finishUnlock(dek, options = {}) {
-  if (db.inspect().kind === 'encrypted') {
-    db.unlock(dek);
-  } else {
-    await encryptLegacyDatabase({
-      db,
-      filePath: DB_FILE,
-      dek,
-      oldKey: options.oldKey || null,
-      sessionsRoot: SESSIONS_DIR
+  try {
+    if (db.inspect().kind === 'encrypted') {
+      db.unlock(dek);
+    } else {
+      await encryptLegacyDatabase({
+        db,
+        filePath: DB_FILE,
+        dek,
+        oldKey: options.oldKey || null,
+        sessionsRoot: SESSIONS_DIR
+      });
+    }
+    const masterKey = Buffer.from(db.data.security.sessionMasterKey || '', 'base64');
+    if (masterKey.length !== 32) throw new Error('The encrypted database session key is invalid.');
+    databaseState = 'encrypted';
+    sessions.setMasterKey(masterKey);
+    currentUser = vault.getUsername();
+    mustChangePassword = Boolean(options.mustChangePassword);
+    lastActivityAt = Date.now();
+    lastAuthAt = Date.now();
+    autoLockWarned = false;
+    startupLog('Login accepted; starting sessions in background');
+    sessions.startAll().catch((error) => {
+      startupError('Failed to start sessions after login', error);
     });
+    queue.start();
+    broadcast('auth:changed', { authenticated: true });
+    return { username: currentUser, mustChangePassword };
+  } catch (error) {
+    if (db && db.mode === 'encrypted') db.lock();
+    if (vault) vault.lock();
+    currentUser = null;
+    mustChangePassword = false;
+    throw error;
   }
-  const masterKey = Buffer.from(db.data.security.sessionMasterKey || '', 'base64');
-  if (masterKey.length !== 32) throw new Error('The encrypted database session key is invalid.');
-  databaseState = 'encrypted';
-  sessions.setMasterKey(masterKey);
-  currentUser = vault.getUsername();
-  mustChangePassword = Boolean(options.mustChangePassword);
-  lastActivityAt = Date.now();
-  lastAuthAt = Date.now();
-  autoLockWarned = false;
-  startupLog('Login accepted; starting sessions in background');
-  sessions.startAll().catch((error) => {
-    startupError('Failed to start sessions after login', error);
-  });
-  queue.start();
-  broadcast('auth:changed', { authenticated: true });
-  return { username: currentUser, mustChangePassword };
 }
 
 function startAutoLockTimer() {
@@ -319,7 +327,8 @@ function snapshot() {
     groups: db.data.groups.map(groupSummary),
     jobs: serializeJobs(),
     settings: db.data.settings,
-    contactsCount: db.data.contacts.length
+    contactsCount: db.data.contacts.length,
+    persistenceError: Boolean(db && db.hasPersistenceError && db.hasPersistenceError())
   };
 }
 
@@ -350,6 +359,9 @@ function checkIpcRate(channel) {
 }
 
 function safeIpcError(error) {
+  if (error && ['db_persist_failed', 'vault_persist_failed', 'auth_persist_failed'].includes(error.code)) {
+    return 'The change could not be saved to disk. Please retry.';
+  }
   const message = friendlyError(error);
   return message
     .replace(/(?:[A-Za-z]:\\|\/)[^\s:'"]+(?:[\\/][^\s:'"]+)+/g, '[local path]')
@@ -390,6 +402,29 @@ const IPC_SCHEMAS = {
   'app:dataDir': []
 };
 
+const IPC_MAX_BYTES = 16 * 1024 * 1024;
+
+function requestByteSize(args) {
+  let total = 0;
+  for (const value of args) {
+    if (typeof value === 'string') {
+      total += Buffer.byteLength(value, 'utf8');
+    } else if (value instanceof ArrayBuffer) {
+      total += value.byteLength;
+    } else if (ArrayBuffer.isView(value)) {
+      total += value.byteLength;
+    } else {
+      try {
+        total += Buffer.byteLength(JSON.stringify(value) || '', 'utf8');
+      } catch (error) {
+        total += IPC_MAX_BYTES;
+      }
+    }
+    if (total > IPC_MAX_BYTES) break;
+  }
+  return total;
+}
+
 function validateIpcArgs(channel, schema, args) {
   const required = schema.filter((type) => !type.endsWith('?')).length;
   if (args.length < required || args.length > schema.length) {
@@ -416,7 +451,7 @@ function handle(channel, handler) {
     try {
       if (!trustedSender(event)) throw ipcError('untrusted_sender', 'Request blocked.');
       if (args.length > 6) throw ipcError('invalid_request', 'Too many arguments.');
-      if (Buffer.byteLength(JSON.stringify(args), 'utf8') > 16 * 1024 * 1024) {
+      if (requestByteSize(args) > IPC_MAX_BYTES) {
         throw ipcError('invalid_request', 'Request is too large.');
       }
       if (!PUBLIC_CHANNELS.has(channel) && (!currentUser || db.mode !== 'encrypted')) {
@@ -654,6 +689,7 @@ function registerIpc() {
       username: currentUser || (hasVault ? vault.getUsername() : (db.data.auth ? db.data.auth.username : '')),
       databaseEncrypted: databaseState === 'encrypted',
       vaultMissing: databaseState === 'encrypted' && !hasVault,
+      persistenceError: Boolean(db && db.hasPersistenceError && db.hasPersistenceError()),
       dataDir: DATA_DIR
     };
   });
@@ -791,9 +827,10 @@ function registerIpc() {
     const id = requiredId(groupId, 'Group');
     const group = db.findGroup(id);
     if (!group) throw new Error('Group not found.');
-    queue.cancelJobsForGroup(id, 'Group removed from the app.');
-    db.data.groups = db.data.groups.filter((item) => item.id !== id);
-    db.save();
+    db.transaction((data) => {
+      queue.cancelJobsForGroup(id, 'Group removed from the app.', { save: false, emit: false });
+      data.groups = data.groups.filter((item) => item.id !== id);
+    }, 'group-delete');
     broadcast('groups:update', db.data.groups.map(fullGroup));
     broadcast('jobs:update', serializeJobs());
     return true;
@@ -886,23 +923,27 @@ function registerIpc() {
   handle('contacts:import', async (rows) => {
     requireRecentAuth();
     requireArray(rows, 'Contacts', 5000);
-    const result = importContacts(db, rows);
-    let namesChanged = 0;
-    if (result.imported > 0) {
-      namesChanged = db.refreshCachedDisplayNames(result.contacts);
-      db.save();
+    const outcome = db.transaction(() => {
+      const result = importContacts(db, rows);
+      let namesChanged = 0;
+      if (result.imported > 0) {
+        namesChanged = db.refreshCachedDisplayNames(result.contacts);
+      }
+      return { result, namesChanged };
+    }, 'contacts-import');
+    if (outcome.result.imported > 0) {
       broadcast('contacts:update', { count: db.data.contacts.length });
-      if (namesChanged > 0) {
+      if (outcome.namesChanged > 0) {
         broadcast('groups:update', db.data.groups.map(fullGroup));
       }
     }
     return {
-      imported: result.imported,
-      named: result.named,
-      unnamed: result.unnamed,
-      skipped: result.skipped,
+      imported: outcome.result.imported,
+      named: outcome.result.named,
+      unnamed: outcome.result.unnamed,
+      skipped: outcome.result.skipped,
       count: db.data.contacts.length,
-      namesChanged
+      namesChanged: outcome.namesChanged
     };
   });
 
@@ -943,11 +984,12 @@ function registerIpc() {
   handle('settings:update', async (patch) => {
     requireRecentAuth();
     const next = validateSettings(patch || {});
-    db.data.settings = next;
-    for (const account of db.data.accounts) {
-      account.dailyActionLimit = next.dailyCap;
-    }
-    db.save();
+    db.transaction((data) => {
+      data.settings = next;
+      for (const account of data.accounts) {
+        account.dailyActionLimit = next.dailyCap;
+      }
+    }, 'settings-update');
     broadcast('settings:update', next);
     queue.kick();
     return next;
@@ -990,6 +1032,13 @@ async function boot() {
   });
   await stage('Loading database', () => {
     db = new Database(DB_FILE);
+    db.setPersistenceErrorHandler(() => {
+      if (queue) queue.pause();
+      broadcast('toast', {
+        type: 'error',
+        message: 'Changes could not be saved to disk. Background actions have been paused.'
+      });
+    });
     let info = null;
     try {
       info = db.inspect();
@@ -1029,6 +1078,7 @@ async function boot() {
   });
   await stage('Initializing session manager', () => {
     sessions = new SessionManager({ db, sessionsRoot: SESSIONS_DIR });
+    sessions.cleanupTombstones();
   });
   await stage('Initializing queue manager', () => {
     queue = new QueueManager({ db, sessions });
@@ -1049,6 +1099,15 @@ if (!singleInstance) {
       if (mainWindow.isMinimized()) mainWindow.restore();
       mainWindow.focus();
     }
+  });
+
+  app.on('web-contents-created', (_event, contents) => {
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    contents.on('will-navigate', (event, url) => {
+      if (url !== TRUSTED_URL) event.preventDefault();
+    });
+    contents.on('will-redirect', (event) => event.preventDefault());
+    contents.on('will-attach-webview', (event) => event.preventDefault());
   });
 
   app.whenReady().then(async () => {

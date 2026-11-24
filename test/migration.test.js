@@ -172,7 +172,7 @@ test('migrates a v2 database on load and persists version 3', (t) => {
   assert.equal(saved.accounts[0].whatsappJid, '212612345678@s.whatsapp.net');
 });
 
-test('backs up an unreadable database instead of silently overwriting it', (t) => {
+test('preserves an unreadable database and fails closed instead of overwriting it', (t) => {
   const { dir, file } = tempDatabase(t);
   const original = '{ this is not valid json';
   fs.writeFileSync(file, original, 'utf8');
@@ -181,12 +181,9 @@ test('backs up an unreadable database instead of silently overwriting it', (t) =
   t.after(() => { console.error = originalConsoleError; });
 
   const database = new Database(file);
-  const data = database.load();
-
-  assert.equal(data.version, 3);
-  assert.deepEqual(data.accounts, []);
+  assert.throws(() => database.load(), (error) => error.code === 'db_corrupt');
   const backups = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
   assert.equal(backups.length, 1);
   assert.equal(fs.readFileSync(path.join(dir, backups[0]), 'utf8'), original);
-  assert.equal(fs.existsSync(file), true);
+  assert.equal(fs.existsSync(file), false);
 });

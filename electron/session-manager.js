@@ -145,10 +145,12 @@ function accountSessionFolder(root, account) {
 }
 
 class SessionManager extends EventEmitter {
-  constructor({ db, sessionsRoot }) {
+  constructor({ db, sessionsRoot, createAuthState }) {
     super();
     this.db = db;
     this.sessionsRoot = sessionsRoot;
+    this.createAuthState = createAuthState || useEncryptedAuthState;
+    this.accountMutationChain = Promise.resolve();
     this.masterKey = null;
     this.sockets = new Map();
     this.reconnectTimers = new Map();
@@ -166,6 +168,101 @@ class SessionManager extends EventEmitter {
 
   setMasterKey(key) {
     this.masterKey = key;
+  }
+
+  withAccountLock(operation) {
+    const run = this.accountMutationChain.then(operation, operation);
+    this.accountMutationChain = run.catch(() => {});
+    return run;
+  }
+
+  saveOrThrow(context) {
+    if (typeof this.db.saveOrThrow === 'function') return this.db.saveOrThrow();
+    if (typeof this.db.save === 'function' && this.db.save() === false) {
+      const error = new Error('The local database could not be saved to disk.');
+      error.code = 'db_persist_failed';
+      throw error;
+    }
+    return true;
+  }
+
+  saveBestEffort(context) {
+    if (typeof this.db.saveBestEffort === 'function') return this.db.saveBestEffort(context);
+    if (typeof this.db.save === 'function') return this.db.save();
+    return true;
+  }
+
+  transaction(mutator, context) {
+    if (typeof this.db.transaction === 'function') return this.db.transaction(mutator, context);
+    const result = mutator(this.db.data);
+    const saved = typeof this.db.save === 'function' ? this.db.save() : true;
+    if (saved === false) {
+      const error = new Error('The local database could not be saved to disk.');
+      error.code = 'db_persist_failed';
+      throw error;
+    }
+    return result;
+  }
+
+  reportPersistenceError(error, context) {
+    if (typeof this.db.reportPersistenceError === 'function') {
+      this.db.reportPersistenceError(error, context);
+    }
+  }
+
+  tombstoneFolder(folder) {
+    if (!fs.existsSync(folder)) return null;
+    const tombstone = path.join(
+      path.dirname(folder),
+      `.deleting-${path.basename(folder)}-${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    fs.renameSync(folder, tombstone);
+    return tombstone;
+  }
+
+  restoreTombstone(tombstone, folder) {
+    if (!tombstone) return;
+    try {
+      if (fs.existsSync(tombstone) && !fs.existsSync(folder)) {
+        fs.renameSync(tombstone, folder);
+      }
+    } catch (error) {
+      console.error('Failed to restore a session folder after a failed operation.');
+    }
+  }
+
+  deleteTombstone(tombstone) {
+    if (!tombstone) return;
+    try {
+      fs.rmSync(tombstone, { recursive: true, force: true });
+    } catch (error) {
+      console.error('Failed to delete a retired session folder.');
+      this.emit('toast', {
+        type: 'error',
+        message: 'A retired WhatsApp session folder could not be deleted. Remove it manually.'
+      });
+    }
+  }
+
+  cleanupTombstones() {
+    const root = path.resolve(this.sessionsRoot);
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch (error) {
+      return 0;
+    }
+    let removed = 0;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !entry.name.startsWith('.deleting-')) continue;
+      try {
+        fs.rmSync(path.join(root, entry.name), { recursive: true, force: true });
+        removed += 1;
+      } catch (error) {
+        // Retry on the next boot; stale tombstones are not used as live sessions.
+      }
+    }
+    return removed;
   }
 
   hasMasterKey() {
@@ -277,7 +374,7 @@ class SessionManager extends EventEmitter {
     if (!group) return { status: 'unknown', error: 'Group not found.' };
     if (!entry || !entry.connected) {
       this.setAdminAccess(account, groupId, 'unknown', 'Account is disconnected.');
-      this.db.save();
+      this.saveBestEffort('session-background');
       this.emit('accounts:update');
       return { status: 'unknown', error: 'Account is disconnected.' };
     }
@@ -289,7 +386,7 @@ class SessionManager extends EventEmitter {
       const message = friendlyError(error);
       this.setAdminAccess(account, groupId, 'unknown', message);
       group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== account.id);
-      this.db.save();
+      this.saveBestEffort('session-background');
       this.emit('accounts:update');
       this.emit('groups:update');
       return { status: 'unknown', error: message };
@@ -298,7 +395,7 @@ class SessionManager extends EventEmitter {
     logRawGroupParticipants('groupMetadata', metadata);
     this.applyMetadataToGroup(group, metadata, account, true);
     const status = this.recordAdminAccess(account, group, metadata);
-    this.db.save();
+    this.saveBestEffort('session-background');
     this.emit('accounts:update');
     this.emit('groups:update');
     return {
@@ -323,7 +420,7 @@ class SessionManager extends EventEmitter {
       for (const group of this.db.data.groups) {
         this.setAdminAccess(account, group.id, 'unknown', message);
       }
-      this.db.save();
+      this.saveBestEffort('session-background');
       this.emit('accounts:update');
       return;
     }
@@ -340,7 +437,7 @@ class SessionManager extends EventEmitter {
         group.hasError = (group.adminIds || []).length === 0;
       }
     }
-    this.db.save();
+    this.saveBestEffort('session-background');
     this.emit('accounts:update');
     this.emit('groups:update');
   }
@@ -362,12 +459,14 @@ class SessionManager extends EventEmitter {
     const folder = accountSessionFolder(this.sessionsRoot, account);
     let authState;
     try {
-      authState = await useEncryptedAuthState(folder, this.masterKey, account.id);
+      authState = await this.createAuthState(folder, this.masterKey, account.id);
     } catch (error) {
-      account.status = 'banned';
+      account.status = 'disconnected';
       account.needsRelink = true;
-      account.lastError = `Could not decrypt session data: ${error.message}`;
-      this.db.save();
+      account.lastError = error && error.code === 'auth_persist_failed'
+        ? 'WhatsApp session credentials could not be saved to disk. Re-link this account.'
+        : 'Could not decrypt session data. Re-link this account.';
+      this.saveBestEffort('session-start-failure');
       this.emit('accounts:update');
       throw error;
     }
@@ -431,19 +530,58 @@ class SessionManager extends EventEmitter {
     this.manualStops.delete(accountId);
 
     sock.ev.on('creds.update', async (update) => {
+      if (!this.db.findAccount(accountId)) return;
       try {
         await authState.saveCreds();
-        const me = (update && update.me) || sock.user;
-        if (this.updateAccountIdentity(account, me)) {
-          this.db.save();
-          this.emit('accounts:update');
-        }
       } catch (error) {
-        console.error('Failed saving credentials:', error);
+        if (entry.authPersistFailed) return;
+        entry.authPersistFailed = true;
+        entry.connected = false;
+        account.status = 'disconnected';
+        account.needsRelink = true;
+        account.lastError = 'WhatsApp session credentials could not be saved to disk. Re-link this account.';
+        this.saveBestEffort('session-credentials');
+        this.emit('accounts:update');
+        this.emit('toast', {
+          type: 'error',
+          message: `${account.alias}: session credentials could not be saved. Re-link the account.`
+        });
+        this.sockets.delete(accountId);
+        try {
+          sock.end(undefined);
+        } catch (closeError) {
+          console.error('Failed to close a session after a credential persistence failure.');
+        }
+        return;
+      }
+      if (entry.authPersistFailed) {
+        entry.authPersistFailed = false;
+        account.lastError = null;
+      }
+      const me = (update && update.me) || sock.user;
+      const previousIdentity = {
+        phoneNumber: account.phoneNumber,
+        whatsappId: account.whatsappId,
+        whatsappJid: account.whatsappJid,
+        whatsappLid: account.whatsappLid
+      };
+      if (this.updateAccountIdentity(account, me)) {
+        try {
+          this.saveOrThrow();
+          this.emit('accounts:update');
+        } catch (error) {
+          Object.assign(account, previousIdentity);
+          this.reportPersistenceError(error, 'session-credentials');
+          this.emit('toast', {
+            type: 'error',
+            message: `${account.alias}: the account identity could not be saved to disk.`
+          });
+        }
       }
     });
 
     sock.ev.on('connection.update', async (update) => {
+      if (!this.db.findAccount(accountId)) return;
       try {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
@@ -478,9 +616,16 @@ class SessionManager extends EventEmitter {
           account.status = autoPaused ? 'paused' : 'connected';
           account.lastError = null;
           this.reconnectAttempts.set(account.id, 0);
-          this.db.save();
           this.invalidateAdminAccess(account, 'Waiting for fresh admin verification.');
-          this.db.save();
+          try {
+            this.saveOrThrow();
+          } catch (error) {
+            this.reportPersistenceError(error, 'session-connected');
+            this.emit('toast', {
+              type: 'error',
+              message: 'The connection state could not be saved to disk.'
+            });
+          }
           this.emit('accounts:update');
           this.emit('connection:open', { accountId: account.id });
           this.syncContacts(account.id).catch(() => {});
@@ -505,7 +650,11 @@ class SessionManager extends EventEmitter {
             account.needsRelink = true;
             account.lastError = 'This account was unlinked from WhatsApp. Re-link it to continue.';
             account.qr = null;
-            this.db.save();
+            try {
+              this.saveOrThrow();
+            } catch (error) {
+              this.reportPersistenceError(error, 'session-logged-out');
+            }
             this.emit('accounts:update');
             this.emit('toast', {
               type: 'error',
@@ -521,7 +670,7 @@ class SessionManager extends EventEmitter {
           }
 
           account.status = account.pausedForDay === this.db.todayKey() ? 'paused' : 'disconnected';
-          this.db.save();
+          this.saveBestEffort('session-disconnected');
           this.emit('accounts:update');
           this.sockets.delete(accountId);
           this.scheduleReconnect(account.id);
@@ -575,7 +724,7 @@ class SessionManager extends EventEmitter {
           if (changed) group.lastSyncedAt = new Date().toISOString();
         }
         if (changed) {
-          this.db.save();
+          this.saveBestEffort('session-background');
           this.emit('groups:update');
         }
       } catch (error) {
@@ -644,7 +793,7 @@ class SessionManager extends EventEmitter {
         group.memberCount = group.members.length;
         group.lastSyncedAt = new Date().toISOString();
         group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
-        this.db.save();
+        this.saveBestEffort('session-background');
         this.emit('groups:update');
         this.refreshGroup(group.id).catch(() => {});
       } catch (error) {
@@ -688,105 +837,120 @@ class SessionManager extends EventEmitter {
     const account = this.db.findAccount(accountId);
     if (account && account.status !== 'banned') {
       account.status = account.pausedForDay === this.db.todayKey() ? 'paused' : 'disconnected';
-      this.db.save();
+      this.saveBestEffort('session-stop');
     }
   }
 
   async addAccount(alias) {
-    if (this.db.data.accounts.length >= this.db.data.settings.maxAccounts) {
-      throw new Error(`You can link up to ${this.db.data.settings.maxAccounts} admin accounts.`);
-    }
-    const cleanAlias = (alias || '').trim();
-    if (!cleanAlias) throw new Error('Give this account an alias.');
-    if (cleanAlias.length > 40) throw new Error('Alias must be 40 characters or fewer.');
-    if (this.db.data.accounts.some((account) => account.alias.toLowerCase() === cleanAlias.toLowerCase())) {
-      throw new Error('An account with this alias already exists.');
-    }
-    const account = this.db.addAccount(cleanAlias);
-    this.emit('accounts:update');
-    this.startAccount(account.id).catch((error) => {
-      console.error('Failed to start new account:', error);
-      this.emit('toast', { type: 'error', message: friendlyError(error) });
+    return this.withAccountLock(async () => {
+      if (this.db.data.accounts.length >= this.db.data.settings.maxAccounts) {
+        throw new Error(`You can link up to ${this.db.data.settings.maxAccounts} admin accounts.`);
+      }
+      const cleanAlias = (alias || '').trim();
+      if (!cleanAlias) throw new Error('Give this account an alias.');
+      if (cleanAlias.length > 40) throw new Error('Alias must be 40 characters or fewer.');
+      if (this.db.data.accounts.some((account) => account.alias.toLowerCase() === cleanAlias.toLowerCase())) {
+        throw new Error('An account with this alias already exists.');
+      }
+      const account = this.db.addAccount(cleanAlias);
+      this.emit('accounts:update');
+      this.startAccount(account.id).catch((error) => {
+        console.error('Failed to start new account:', error);
+        this.emit('toast', { type: 'error', message: friendlyError(error) });
+      });
+      return account.id;
     });
-    return account.id;
   }
 
   async relinkAccount(accountId) {
-    const account = this.db.findAccount(accountId);
-    if (!account) throw new Error('Account not found.');
-    await this.stopAccount(accountId);
-    const folder = accountSessionFolder(this.sessionsRoot, account);
-    try {
-      fs.rmSync(folder, { recursive: true, force: true });
-    } catch (error) {
-      console.error('Failed to clear old session:', error);
-    }
-    const previousIdentity = identitySummary(account);
-    account.phoneNumber = '';
-    account.whatsappId = '';
-    account.whatsappJid = '';
-    account.whatsappLid = '';
-    for (const group of this.db.data.groups) {
-      group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
-      group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, previousIdentity));
-      group.members = (group.members || []).filter((member) => !identityMatches(member, previousIdentity));
-      group.memberCount = group.members.length;
-      group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
-    }
-    account.status = 'disconnected';
-    account.needsRelink = false;
-    account.pendingOnboarding = true;
-    account.onboardingError = null;
-    account.adminAccess = {};
-    account.qr = null;
-    account.connectedAt = null;
-    account.lastError = null;
-    this.db.save();
-    this.emit('accounts:update');
-    await this.startAccount(accountId);
-    return true;
+    return this.withAccountLock(async () => {
+      const account = this.db.findAccount(accountId);
+      if (!account) throw new Error('Account not found.');
+      await this.stopAccount(accountId);
+      const folder = accountSessionFolder(this.sessionsRoot, account);
+      const tombstone = this.tombstoneFolder(folder);
+      try {
+        const previousIdentity = identitySummary(account);
+        this.transaction((data) => {
+          const targetAccount = data.accounts.find((item) => item.id === accountId);
+          if (!targetAccount) throw new Error('Account not found.');
+          targetAccount.phoneNumber = '';
+          targetAccount.whatsappId = '';
+          targetAccount.whatsappJid = '';
+          targetAccount.whatsappLid = '';
+          for (const group of data.groups) {
+            group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
+            group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, previousIdentity));
+            group.members = (group.members || []).filter((member) => !identityMatches(member, previousIdentity));
+            group.memberCount = group.members.length;
+            group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
+          }
+          targetAccount.status = 'disconnected';
+          targetAccount.needsRelink = false;
+          targetAccount.pendingOnboarding = true;
+          targetAccount.onboardingError = null;
+          targetAccount.adminAccess = {};
+          targetAccount.qr = null;
+          targetAccount.connectedAt = null;
+          targetAccount.lastError = null;
+        }, 'account-relink');
+      } catch (error) {
+        this.restoreTombstone(tombstone, folder);
+        throw error;
+      }
+      this.deleteTombstone(tombstone);
+      this.emit('accounts:update');
+      await this.startAccount(accountId);
+      return true;
+    });
   }
 
   async removeAccount(accountId) {
-    const account = this.db.findAccount(accountId);
-    if (!account) throw new Error('Account not found.');
-    const entry = this.sockets.get(accountId);
-    if (entry) {
-      try {
-        await entry.sock.logout();
-      } catch (error) {
+    return this.withAccountLock(async () => {
+      const account = this.db.findAccount(accountId);
+      if (!account) throw new Error('Account not found.');
+      const entry = this.sockets.get(accountId);
+      if (entry) {
         try {
-          entry.sock.end(undefined);
-        } catch (err) {
-          console.error(err);
+          await entry.sock.logout();
+        } catch (error) {
+          try {
+            entry.sock.end(undefined);
+          } catch (err) {
+            console.error('Failed to close the session during account removal.');
+          }
         }
+        this.sockets.delete(accountId);
       }
-      this.sockets.delete(accountId);
-    }
-    const timer = this.reconnectTimers.get(accountId);
-    if (timer) clearTimeout(timer);
-    this.reconnectTimers.delete(accountId);
-    const folder = accountSessionFolder(this.sessionsRoot, account);
-    try {
-      fs.rmSync(folder, { recursive: true, force: true });
-    } catch (error) {
-      console.error('Failed to delete session folder:', error);
-    }
-    this.db.data.accounts = this.db.data.accounts.filter((item) => item.id !== accountId);
-    for (const group of this.db.data.groups) {
-      group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
-      group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, account));
-      group.members = (group.members || []).filter((member) => !identityMatches(member, account));
-      group.memberCount = group.members.length;
-      group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
-    }
-    for (const contact of this.db.data.contacts) {
-      contact.sourceAccounts = (contact.sourceAccounts || []).filter((id) => id !== accountId);
-    }
-    this.db.save();
-    this.emit('accounts:update');
-    this.emit('groups:update');
-    return true;
+      const timer = this.reconnectTimers.get(accountId);
+      if (timer) clearTimeout(timer);
+      this.reconnectTimers.delete(accountId);
+      const folder = accountSessionFolder(this.sessionsRoot, account);
+      const tombstone = this.tombstoneFolder(folder);
+      try {
+        this.transaction((data) => {
+          const removed = data.accounts.find((item) => item.id === accountId);
+          data.accounts = data.accounts.filter((item) => item.id !== accountId);
+          for (const group of data.groups) {
+            group.adminAccountIds = (group.adminAccountIds || []).filter((id) => id !== accountId);
+            group.adminIds = (group.adminIds || []).filter((adminId) => !identityMatches(adminId, removed || account));
+            group.members = (group.members || []).filter((member) => !identityMatches(member, removed || account));
+            group.memberCount = group.members.length;
+            group.hasError = group.adminIds.length === 0 && !group.members.some((member) => member.isAdmin);
+          }
+          for (const contact of data.contacts) {
+            contact.sourceAccounts = (contact.sourceAccounts || []).filter((id) => id !== accountId);
+          }
+        }, 'account-remove');
+      } catch (error) {
+        this.restoreTombstone(tombstone, folder);
+        throw error;
+      }
+      this.deleteTombstone(tombstone);
+      this.emit('accounts:update');
+      this.emit('groups:update');
+      return true;
+    });
   }
 
   enqueueContactWork(accountId, work) {
@@ -1073,7 +1237,7 @@ class SessionManager extends EventEmitter {
       if (!result || !result.contact) return 0;
       const changed = this.db.refreshCachedDisplayNames([result.contact]);
       if (result.changed || changed > 0) {
-        this.db.save();
+        this.saveBestEffort('contact-identities');
         this.emit('contacts:update');
         if (changed > 0) this.emit('groups:update');
       }
@@ -1170,7 +1334,7 @@ class SessionManager extends EventEmitter {
 
     if (pending.length > 0) {
       const namesChanged = this.db.refreshCachedDisplayNames(touchedContacts);
-      this.db.save();
+      this.saveBestEffort('contact-ingest');
       this.emit('contacts:update');
       if (namesChanged > 0) this.emit('groups:update');
     }
@@ -1261,7 +1425,7 @@ class SessionManager extends EventEmitter {
       }
 
       const namesChanged = this.db.refreshCachedDisplayNames(touchedContacts);
-      this.db.save();
+      this.saveBestEffort('contact-sync');
       this.emit('contacts:update');
       if (namesChanged > 0) this.emit('groups:update');
     } catch (error) {
@@ -1340,7 +1504,7 @@ class SessionManager extends EventEmitter {
         alreadyManaged: this.db.data.groups.some((group) => group.id === metadata.id)
       });
     }
-    this.db.save();
+    this.saveOrThrow();
     result.sort((a, b) => a.name.localeCompare(b.name));
     return result;
   }
@@ -1459,10 +1623,17 @@ class SessionManager extends EventEmitter {
       };
       this.applyMetadataToGroup(newGroup, metadata, account, true);
       newGroup.addedByAccountId = accountId;
-      this.db.data.groups.push(newGroup);
+      newGroup.__pending = true;
       added.push(newGroup);
     }
-    this.db.save();
+    this.transaction((data) => {
+      for (const newGroup of added) {
+        if (newGroup.__pending) {
+          delete newGroup.__pending;
+          data.groups.push(newGroup);
+        }
+      }
+    }, 'groups-add');
     this.emit('groups:update');
     return added.length;
   }
@@ -1485,7 +1656,7 @@ class SessionManager extends EventEmitter {
       const error = new Error('No connected admin account can refresh this group.');
       if (options.strict) throw error;
       group.hasError = true;
-      this.db.save();
+      this.saveBestEffort('group-refresh-missing-account');
       return group;
     }
     let lastError = null;
@@ -1496,7 +1667,7 @@ class SessionManager extends EventEmitter {
         logRawGroupParticipants('groupMetadata', metadata);
         this.applyMetadataToGroup(group, metadata, account, true);
         this.recordAdminAccess(account, group, metadata);
-        this.db.save();
+        this.saveOrThrow();
         this.emit('accounts:update');
         this.emit('groups:update');
         return group;
@@ -1661,7 +1832,7 @@ class SessionManager extends EventEmitter {
           if (promotedMember) promotedMember.isAdmin = true;
           group.hasError = group.adminIds.length === 0;
           await this.refreshGroup(group.id).catch(() => {});
-          this.db.save();
+          this.saveBestEffort('onboarding-promotion');
           this.emit('groups:update');
           this.emit('toast', {
             type: 'success',
@@ -1680,7 +1851,7 @@ class SessionManager extends EventEmitter {
       }
       account.pendingOnboarding = false;
       account.onboardingError = errors.length ? errors.join('\n') : null;
-      this.db.save();
+      this.saveBestEffort('onboarding-result');
       this.emit('accounts:update');
       if (errors.length) {
         this.emit('toast', {
